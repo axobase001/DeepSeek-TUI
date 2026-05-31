@@ -3,6 +3,11 @@
 //! Provides tools to spawn background sub-agents, query their status,
 //! and retrieve results. Sub-agents run with a filtered toolset and
 //! inherit the workspace configuration from the main session.
+//!
+//! v0.8.33's new model-facing surface is `agent_open` / `agent_eval` /
+//! `agent_close`. Some older structs and manager helpers remain in this
+//! module while the durable runtime is being reused by the new surface.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -24,6 +29,7 @@ use crate::config::MAX_SUBAGENTS;
 use crate::core::events::Event;
 use crate::llm_client::LlmClient;
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
+use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
 use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
 use crate::tools::spec::{
@@ -56,14 +62,26 @@ fn release_resident_leases_for(agent_id: &str) {
     }
 }
 
-const DEFAULT_MAX_STEPS: u32 = 100;
+/// Default maximum steps for sub-agent loops. Set to `u32::MAX` to remove the
+/// arbitrary fixed cap (#2034). Sub-agents run until they produce a final text
+/// response (no tool calls), are cancelled by the parent, or hit a configured
+/// explicit budget. Callers that want a hard bound can override `max_steps` on
+/// the `SubAgentManager`.
+const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
 /// stuck API call from blocking the sub-agent indefinitely.
-const STEP_API_TIMEOUT: Duration = Duration::from_secs(120);
+/// Legacy fallback for the per-step DeepSeek API timeout. The active timeout
+/// now travels on `SubAgentRuntime::step_api_timeout` so users can override
+/// it via `[subagents] api_timeout_secs` in `~/.deepseek/config.toml`. The
+/// constant only exists for tests/stub runtimes that need a hard-coded
+/// default; production runtimes set the field explicitly (#1806, #1808).
+const DEFAULT_STEP_API_TIMEOUT: Duration =
+    Duration::from_secs(crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS);
 const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_RESULT_TIMEOUT_MS: u64 = 30_000;
+#[allow(dead_code)] // Legacy agent_wait clamp; new agent_eval uses DEFAULT/MAX.
 const MIN_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RESULT_TIMEOUT_MS: u64 = 3_600_000;
 const COMPLETED_AGENT_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -71,12 +89,19 @@ const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
 
-const VALID_SUBAGENT_TYPES: &str = "general, explore, plan, review, implementer, verifier, custom, \
-     worker, explorer, awaiter, default, implement, builder, verify, validator, tester";
-/// Whale species names rotated through `whale_nickname_for_index` to label
-/// sub-agents in the UI. English and Simplified-Chinese names are interleaved
-/// so any newly spawned agent has a roughly even chance of either — the goal
-/// is friendly variety, not a strict locale match.
+const VALID_SUBAGENT_TYPES: &str = "general, explore, plan, review, implementer, verifier, tool_agent, custom, \
+     worker, explorer, awaiter, default, implement, builder, verify, validator, tester, tool-agent, executor, fin";
+/// Whale species used as friendly names for sub-agents in the UI. The full
+/// Cetacea infraorder — baleen whales (Mysticeti), toothed whales
+/// (Odontoceti), plus select dolphin species (family Delphinidae) that
+/// don't conflate with existing agent type labels. Porpoises (Phocoenidae)
+/// are excluded because their name doesn't carry well as a friendly label.
+///
+/// English and Simplified-Chinese names are interleaved so any newly spawned
+/// agent has a roughly even chance of either — the goal is friendly variety,
+/// not a strict locale match.
+///
+/// Taxonomy source: Society for Marine Mammalogy (2025).
 pub const WHALE_NICKNAMES: &[&str] = &[
     "Blue",
     "蓝鲸",
@@ -94,6 +119,14 @@ pub const WHALE_NICKNAMES: &[&str] = &[
     "小须鲸",
     "Antarctic Minke",
     "南极小须鲸",
+    "Pygmy Right",
+    "小露脊鲸",
+    "Omura's",
+    "大村鲸",
+    "Eden's",
+    "艾氏鲸",
+    "Rice's",
+    "赖斯鲸",
     "Gray",
     "灰鲸",
     "Bowhead",
@@ -126,7 +159,98 @@ pub const WHALE_NICKNAMES: &[&str] = &[
     "贝氏喙鲸",
     "Blainville's Beaked",
     "柏氏喙鲸",
+    "Ginkgo-toothed Beaked",
+    "银杏齿喙鲸",
+    "Strap-toothed",
+    "带齿喙鲸",
+    "Stejneger's Beaked",
+    "斯氏喙鲸",
+    "Dwarf Sperm",
+    "小抹香鲸",
+    "Pygmy Sperm",
+    "侏儒抹香鲸",
+    "Rough-toothed",
+    "糙齿海豚",
+    "Atlantic Spotted",
+    "大西洋斑海豚",
+    "Pantropical Spotted",
+    "热带斑海豚",
+    "Spinner",
+    "长吻飞旋海豚",
+    "Clymene",
+    "短吻飞旋海豚",
+    "Striped",
+    "条纹海豚",
+    "Common Bottlenose",
+    "宽吻海豚",
+    "Indo-Pacific Bottlenose",
+    "印太瓶鼻海豚",
+    "Risso's",
+    "灰海豚",
+    "Commerson's",
+    "花斑海豚",
+    "Chilean",
+    "智利海豚",
+    "Heaviside's",
+    "海氏矮海豚",
+    "Hector's",
+    "赫氏矮海豚",
+    "Amazon River",
+    "亚马逊河豚",
+    "Ganges River",
+    "恒河豚",
+    "Indus River",
+    "印度河豚",
+    "La Plata",
+    "拉普拉塔河豚",
+    "Franciscana",
+    "拉河豚",
 ];
+
+/// Return a deterministic whale name for a given agent ID using a hash of
+/// the ID string. The same ID always gets the same name — stable across
+/// session restarts for persisted agents.
+#[must_use]
+pub fn whale_name_for_id(id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    let idx = (hasher.finish() as usize) % WHALE_NICKNAMES.len();
+    WHALE_NICKNAMES[idx].to_string()
+}
+
+/// Assign a unique whale name for an agent ID, avoiding collisions with
+/// names already in `active_names`. If the deterministic name is taken,
+/// appends a numeric suffix (e.g. "Orca (2)").
+#[must_use]
+pub fn assign_unique_whale_name(
+    id: &str,
+    active_names: &std::collections::HashSet<String>,
+) -> String {
+    let base = whale_name_for_id(id);
+    if !active_names.contains(&base) {
+        return base;
+    }
+    // Deterministic suffix from the same hash to keep it stable
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    let suffix_seed = hasher.finish();
+    for i in 2.. {
+        let candidate = format!("{base} ({i})");
+        if !active_names.contains(&candidate) {
+            return candidate;
+        }
+        // Vary the probe using the seed
+        let probe = (suffix_seed.wrapping_add(i as u64)) % 100;
+        let candidate2 = format!("{base} ({probe})");
+        if !active_names.contains(&candidate2) {
+            return candidate2;
+        }
+    }
+    // Fallback (should never reach here)
+    format!("{base} ({})", id.get(..4).unwrap_or("?"))
+}
 
 /// Removal version for deprecated tool aliases.
 const DEPRECATION_REMOVAL_VERSION: &str = "0.8.0";
@@ -232,6 +356,11 @@ pub enum SubAgentType {
     /// Distinct from `Review` in that Review reads code and grades it;
     /// Verifier *runs* tests and reports the outcome (#404).
     Verifier,
+    /// Tool execution — a fast, non-thinking Flash V4 executor for simple
+    /// machine-bound tasks. Intended as the experimental "Fin" lane: the
+    /// parent does planning/synthesis while this child runs tools and reports
+    /// compact facts.
+    ToolAgent,
     /// Custom tool access defined at spawn time.
     Custom,
 }
@@ -249,6 +378,9 @@ impl SubAgentType {
             "review" | "code-review" | "code_review" | "reviewer" => Some(Self::Review),
             "implementer" | "implement" | "implementation" | "builder" => Some(Self::Implementer),
             "verifier" | "verify" | "verification" | "validator" | "tester" => Some(Self::Verifier),
+            "tool-agent" | "tool_agent" | "toolagent" | "executor" | "execution" | "fin" => {
+                Some(Self::ToolAgent)
+            }
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -263,6 +395,7 @@ impl SubAgentType {
             Self::Review => "review",
             Self::Implementer => "implementer",
             Self::Verifier => "verifier",
+            Self::ToolAgent => "tool_agent",
             Self::Custom => "custom",
         }
     }
@@ -270,15 +403,17 @@ impl SubAgentType {
     /// Get the system prompt for this agent type.
     #[must_use]
     pub fn system_prompt(&self) -> String {
-        match self {
-            Self::General => GENERAL_AGENT_PROMPT.to_string(),
-            Self::Explore => EXPLORE_AGENT_PROMPT.to_string(),
-            Self::Plan => PLAN_AGENT_PROMPT.to_string(),
-            Self::Review => REVIEW_AGENT_PROMPT.to_string(),
-            Self::Implementer => IMPLEMENTER_AGENT_PROMPT.to_string(),
-            Self::Verifier => VERIFIER_AGENT_PROMPT.to_string(),
-            Self::Custom => CUSTOM_AGENT_PROMPT.to_string(),
-        }
+        let role_intro = match self {
+            Self::General => GENERAL_AGENT_INTRO,
+            Self::Explore => EXPLORE_AGENT_INTRO,
+            Self::Plan => PLAN_AGENT_INTRO,
+            Self::Review => REVIEW_AGENT_INTRO,
+            Self::Implementer => IMPLEMENTER_AGENT_INTRO,
+            Self::Verifier => VERIFIER_AGENT_INTRO,
+            Self::ToolAgent => TOOL_AGENT_INTRO,
+            Self::Custom => CUSTOM_AGENT_INTRO,
+        };
+        format!("{role_intro}{SUBAGENT_OUTPUT_FORMAT}")
     }
 
     /// Get the default allowed tools for this agent type.
@@ -388,6 +523,22 @@ impl SubAgentType {
                 "diagnostics",
                 "note",
             ],
+            Self::ToolAgent => vec![
+                "list_dir",
+                "read_file",
+                "grep_files",
+                "file_search",
+                "image_ocr",
+                "fetch_url",
+                "web_search",
+                "web.run",
+                "exec_shell",
+                "exec_shell_wait",
+                "exec_shell_interact",
+                "exec_wait",
+                "exec_interact",
+                "handle_read",
+            ],
             Self::Custom => vec![], // Must be provided by caller.
         }
     }
@@ -406,7 +557,10 @@ pub enum SubAgentStatus {
 /// Snapshot of sub-agent state for tool results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentResult {
+    pub name: String,
     pub agent_id: String,
+    pub context_mode: String,
+    pub fork_context: bool,
     pub agent_type: SubAgentType,
     pub assignment: SubAgentAssignment,
     #[serde(default)]
@@ -431,8 +585,10 @@ fn is_false(b: &bool) -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SubAgentSpawnOptions {
+    pub name: Option<String>,
     pub model: Option<String>,
     pub nickname: Option<String>,
+    pub fork_context: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +606,7 @@ impl WaitMode {
         }
     }
 
+    #[allow(dead_code)] // Legacy wait metadata while registry moves to agent_eval.
     fn as_str(self) -> &'static str {
         match self {
             Self::Any => "any",
@@ -477,6 +634,7 @@ struct SubAgentInput {
 
 #[derive(Debug, Clone)]
 struct SpawnRequest {
+    session_name: Option<String>,
     prompt: String,
     agent_type: SubAgentType,
     assignment: SubAgentAssignment,
@@ -492,6 +650,12 @@ struct SpawnRequest {
     /// locality. A global ownership table prevents two agents from holding
     /// a resident lease on the same file simultaneously.
     resident_file: Option<String>,
+    /// When true, seed the child with the parent's system prompt and message
+    /// prefix before appending the child task.
+    fork_context: bool,
+    /// Optional recursion budget for descendants opened by this child.
+    /// `0` means the child may not call `agent_open` recursively.
+    max_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -506,6 +670,10 @@ struct AssignRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSubAgent {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_name: Option<String>,
+    #[serde(default)]
+    fork_context: bool,
     agent_type: SubAgentType,
     prompt: String,
     assignment: SubAgentAssignment,
@@ -548,11 +716,39 @@ impl Default for PersistedSubAgentState {
 /// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
 pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 3;
 
+/// Terminal-state notification emitted to the engine's parent turn loop
+/// when one of its direct children finishes (issue #756). Carries the
+/// already-rendered `<codewhale:subagent.done>` sentinel that the model
+/// expects in the transcript per `prompts/base.md`.
+#[derive(Debug, Clone)]
+pub struct SubAgentCompletion {
+    /// The completing child's agent id. Held for routing/logging — the
+    /// engine's turn loop does not currently key on it (it just injects
+    /// the payload), but downstream tooling and tests need the field.
+    #[allow(dead_code)]
+    pub agent_id: String,
+    /// Human summary on line 1, sentinel on line 2. Same payload shape as
+    /// `Event::AgentComplete::result`.
+    pub payload: String,
+}
+
+/// Parent transcript snapshot available to sub-agents that opt into context
+/// forking. The system prompt and leading messages are kept byte-identical to
+/// the parent request so DeepSeek's prefix cache can reuse the warmed prefix.
+#[derive(Clone, Debug)]
+pub struct SubAgentForkContext {
+    pub system: Option<SystemPrompt>,
+    pub messages: Vec<Message>,
+    pub structured_state_block: Option<String>,
+}
+
 /// Runtime configuration for spawning sub-agents.
 ///
 /// Carries everything a child needs to (a) build its own tool registry —
-/// including the manager so grandchildren can spawn — and (b) cooperate
-/// with the rest of the spawn tree on cancellation and depth cap.
+/// including the manager so grandchildren can spawn — and (b) cooperate with
+/// lifecycle cancellation and depth caps. `child_runtime()` links cancellation
+/// tokens, while `background_runtime()` deliberately detaches long-running
+/// `agent_open` sessions from the caller's turn token.
 #[derive(Clone)]
 pub struct SubAgentRuntime {
     pub client: DeepSeekClient,
@@ -574,13 +770,28 @@ pub struct SubAgentRuntime {
     /// exceed this is rejected at the spawn entry. Use `>` (strictly
     /// greater than) so equality is allowed — matches codex's pattern.
     pub max_spawn_depth: u32,
-    /// Cooperative cancellation token. Children derive a child_token() from
-    /// the parent so cancelling the root cascades down.
+    /// Cooperative cancellation token. Direct `child_runtime()` callers derive
+    /// a child token from the parent; model-visible `agent_open` uses
+    /// `background_runtime()` to replace that token with a detached one.
     pub cancel_token: CancellationToken,
     /// Structured progress / lifecycle stream. Cloned across children so the
     /// whole spawn tree publishes into one ordered, fan-out-able mailbox.
     /// `None` only when no consumer is wired (legacy entry points / tests).
     pub mailbox: Option<Mailbox>,
+    /// Wakeup channel for the engine's parent turn loop (issue #756). Only
+    /// the engine's direct children fire on this — propagated to descendants
+    /// via clone but gated to `spawn_depth == 1` at the send site so the
+    /// parent isn't flooded with grandchild completions it didn't directly
+    /// orchestrate. `None` when no consumer is wired (tests / legacy paths).
+    pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
+    /// Snapshot of the request prefix visible to an opt-in forked child.
+    pub fork_context: Option<SubAgentForkContext>,
+    /// Per-step DeepSeek API timeout for the child's `create_message` call.
+    /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800) at
+    /// engine construction so a slow but legitimate model turn does not
+    /// false-timeout the child mid-thinking. `child_runtime()` and
+    /// `background_runtime()` preserve the parent's value (#1806, #1808).
+    pub step_api_timeout: Duration,
 }
 
 impl SubAgentRuntime {
@@ -612,13 +823,46 @@ impl SubAgentRuntime {
             max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
             cancel_token: CancellationToken::new(),
             mailbox: None,
+            parent_completion_tx: None,
+            fork_context: None,
+            step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         }
     }
 
-    /// Attach a `Mailbox` so this runtime (and every descendant — children
-    /// clone it) publishes structured `MailboxMessage` envelopes alongside
-    /// the legacy `Event` stream. Pair with [`Self::with_cancel_token`] when
-    /// you want close-as-cancel to propagate the same way.
+    /// Override the per-step DeepSeek API timeout (default
+    /// `DEFAULT_STEP_API_TIMEOUT`). Called by the engine after reading
+    /// `[subagents] api_timeout_secs`. Tests may use this to fail fast
+    /// without waiting the legacy 120 seconds (#1806, #1808).
+    #[must_use]
+    pub fn with_step_api_timeout(mut self, timeout: Duration) -> Self {
+        self.step_api_timeout = timeout;
+        self
+    }
+
+    /// Attach the wakeup channel so the engine's parent turn loop can resume
+    /// when this runtime's direct children finish (issue #756). The channel
+    /// is propagated to descendants via clone, but only `spawn_depth == 1`
+    /// agents fire on it — see `run_subagent_task`.
+    #[must_use]
+    pub fn with_parent_completion_tx(
+        mut self,
+        tx: mpsc::UnboundedSender<SubAgentCompletion>,
+    ) -> Self {
+        self.parent_completion_tx = Some(tx);
+        self
+    }
+
+    /// Attach the current parent request prefix for `fork_context` spawns.
+    #[must_use]
+    pub fn with_fork_context(mut self, context: SubAgentForkContext) -> Self {
+        self.fork_context = Some(context);
+        self
+    }
+
+    /// Attach a `Mailbox` so this runtime and its derived children publish
+    /// structured `MailboxMessage` envelopes alongside the legacy `Event`
+    /// stream. Pair with [`Self::with_cancel_token`] when the mailbox close
+    /// token should match this runtime's cancellation token.
     #[must_use]
     #[allow(dead_code)] // wired by #128 (in-transcript cards) when it lands.
     pub fn with_mailbox(mut self, mailbox: Mailbox) -> Self {
@@ -687,18 +931,17 @@ impl SubAgentRuntime {
     }
 
     /// Build a child runtime cloning this one, incrementing `spawn_depth`,
-    /// deriving a child cancellation token, and forcing `auto_approve` on
-    /// the child's `ToolContext`. Used at spawn entry to construct the
-    /// runtime the new sub-agent will see.
+    /// and deriving a child cancellation token. Used at spawn entry to
+    /// construct the runtime the new sub-agent will see.
     ///
-    /// The `auto_approve` override is deliberate: spawning IS the approval.
-    /// Per-tool prompts inside a child would break delegation, so children
-    /// inherit a YOLO-equivalent context regardless of the parent's mode.
-    /// The workspace boundary + sandbox profile still apply.
+    /// Children inherit the parent's approval state. A non-auto parent can
+    /// still delegate read-only investigation, but approval-gated child tools
+    /// are blocked by the sub-agent registry instead of being silently run
+    /// without a prompt.
     #[must_use]
     pub fn child_runtime(&self) -> Self {
         let mut child_context = self.context.clone();
-        child_context.auto_approve = true;
+        child_context.auto_approve = self.context.auto_approve;
         Self {
             client: self.client.clone(),
             model: self.model.clone(),
@@ -714,6 +957,9 @@ impl SubAgentRuntime {
             max_spawn_depth: self.max_spawn_depth,
             cancel_token: self.cancel_token.child_token(),
             mailbox: self.mailbox.clone(),
+            parent_completion_tx: self.parent_completion_tx.clone(),
+            fork_context: self.fork_context.clone(),
+            step_api_timeout: self.step_api_timeout,
         }
     }
 
@@ -727,6 +973,8 @@ impl SubAgentRuntime {
 /// A running sub-agent instance.
 pub struct SubAgent {
     pub id: String,
+    pub session_name: String,
+    pub fork_context: bool,
     pub agent_type: SubAgentType,
     pub prompt: String,
     pub assignment: SubAgentAssignment,
@@ -736,7 +984,8 @@ pub struct SubAgent {
     pub result: Option<String>,
     pub steps_taken: u32,
     pub started_at: Instant,
-    /// `None` = full registry inheritance (v0.6.6 default).
+    /// `None` = full registry inheritance, with approval-gated tools still
+    /// blocked unless the parent runtime is auto-approved.
     /// `Some(list)` = explicit narrow allowlist (Custom agents, legacy).
     pub allowed_tools: Option<Vec<String>>,
     /// Stable id of the manager that spawned this agent (#405). Compared
@@ -748,9 +997,11 @@ pub struct SubAgent {
 }
 
 impl SubAgent {
-    /// Create a new sub-agent.
+    /// Create a new sub-agent. The `id` is generated by the caller so that
+    /// deterministic whale-naming can hash the ID before construction.
     #[allow(clippy::too_many_arguments)]
     fn new(
+        id: String,
         agent_type: SubAgentType,
         prompt: String,
         assignment: SubAgentAssignment,
@@ -760,10 +1011,12 @@ impl SubAgent {
         input_tx: mpsc::UnboundedSender<SubAgentInput>,
         session_boot_id: String,
     ) -> Self {
-        let id = format!("agent_{}", &Uuid::new_v4().to_string()[..8]);
+        let session_name = id.clone();
 
         Self {
             id,
+            session_name,
+            fork_context: false,
             agent_type,
             prompt,
             assignment,
@@ -784,7 +1037,10 @@ impl SubAgent {
     #[must_use]
     pub fn snapshot(&self) -> SubAgentResult {
         SubAgentResult {
+            name: self.session_name.clone(),
             agent_id: self.id.clone(),
+            context_mode: if self.fork_context { "forked" } else { "fresh" }.to_string(),
+            fork_context: self.fork_context,
             agent_type: self.agent_type.clone(),
             assignment: self.assignment.clone(),
             model: self.model.clone(),
@@ -865,6 +1121,8 @@ impl SubAgentManager {
         for agent in self.agents.values() {
             agents.push(PersistedSubAgent {
                 id: agent.id.clone(),
+                session_name: Some(agent.session_name.clone()),
+                fork_context: agent.fork_context,
                 agent_type: agent.agent_type.clone(),
                 prompt: agent.prompt.clone(),
                 assignment: agent.assignment.clone(),
@@ -893,7 +1151,11 @@ impl SubAgentManager {
 
     fn persist_state_best_effort(&self) {
         if let Err(err) = self.persist_state() {
-            eprintln!("Failed to persist sub-agent state: {err}");
+            // Must not be `eprintln!` — raw stderr inside the alt-screen
+            // leaks into the buffer and produces the scroll-demon
+            // regression (#1085). Routed through tracing so the
+            // file-backed subscriber in `runtime_log` captures it.
+            tracing::warn!(target: "subagent", ?err, "failed to persist sub-agent state");
         }
     }
 
@@ -931,6 +1193,11 @@ impl SubAgentManager {
             };
             let agent = SubAgent {
                 id: persisted.id.clone(),
+                session_name: persisted
+                    .session_name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| persisted.id.clone()),
+                fork_context: persisted.fork_context,
                 agent_type: persisted.agent_type,
                 prompt: persisted.prompt,
                 assignment: persisted.assignment,
@@ -1044,12 +1311,19 @@ impl SubAgentManager {
             runtime.model = model.to_string();
         }
         let effective_model = runtime.model.clone();
+        let agent_id = format!("agent_{}", &Uuid::new_v4().to_string()[..8]);
+        let active_names: std::collections::HashSet<String> = self
+            .agents
+            .values()
+            .filter_map(|a| a.nickname.clone())
+            .collect();
         let nickname = options
             .nickname
-            .or_else(|| Some(whale_nickname_for_index(self.agents.len())));
+            .or_else(|| Some(assign_unique_whale_name(&agent_id, &active_names)));
         let tools = build_allowed_tools(&agent_type, allowed_tools, runtime.allow_shell)?;
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let mut agent = SubAgent::new(
+            agent_id.clone(),
             agent_type.clone(),
             prompt.clone(),
             assignment.clone(),
@@ -1059,6 +1333,22 @@ impl SubAgentManager {
             input_tx,
             self.current_session_boot_id.clone(),
         );
+        if let Some(name) = options
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if self
+                .agents
+                .values()
+                .any(|existing| existing.session_name == name)
+            {
+                return Err(anyhow!("Sub-agent session name '{name}' is already in use"));
+            }
+            agent.session_name = name.to_string();
+        }
+        agent.fork_context = options.fork_context;
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
         let max_steps = self.max_steps;
@@ -1078,6 +1368,7 @@ impl SubAgentManager {
             prompt,
             assignment,
             allowed_tools: tools,
+            fork_context: options.fork_context,
             started_at,
             max_steps,
             input_rx,
@@ -1107,6 +1398,29 @@ impl SubAgentManager {
         Ok(agent.snapshot())
     }
 
+    /// Resolve either a durable agent id or a model-facing session name.
+    fn resolve_agent_ref(&self, agent_ref: &str) -> Result<String> {
+        let agent_ref = agent_ref.trim();
+        if self.agents.contains_key(agent_ref) {
+            return Ok(agent_ref.to_string());
+        }
+
+        let matches = self
+            .agents
+            .values()
+            .filter(|agent| agent.session_name == agent_ref)
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => Err(anyhow!("Agent session {agent_ref} not found")),
+            _ => Err(anyhow!(
+                "Agent session name '{agent_ref}' is ambiguous; use an agent_id"
+            )),
+        }
+    }
+
     /// Cancel a running sub-agent.
     pub fn cancel(&mut self, agent_id: &str) -> Result<SubAgentResult> {
         let (snapshot, changed) = {
@@ -1134,6 +1448,7 @@ impl SubAgentManager {
     }
 
     /// Resume a non-running sub-agent by restarting it with the original assignment.
+    #[allow(dead_code)] // Legacy agent_resume path; retained until registry migration.
     pub fn resume(
         &mut self,
         manager_handle: SharedSubAgentManager,
@@ -1183,6 +1498,7 @@ impl SubAgentManager {
                 prompt: agent.prompt.clone(),
                 assignment: agent.assignment.clone(),
                 allowed_tools: agent.allowed_tools.clone(),
+                fork_context: false,
                 started_at: restarted_at,
                 max_steps: self.max_steps,
                 input_rx,
@@ -1436,7 +1752,104 @@ impl SubAgentManager {
 /// Thread-safe wrapper for `SubAgentManager`.
 pub type SharedSubAgentManager = Arc<RwLock<SubAgentManager>>;
 
+/// Model-facing session projection returned by the v0.8.33 sub-agent API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgentSessionProjection {
+    pub name: String,
+    pub agent_id: String,
+    pub status: String,
+    pub terminal: bool,
+    pub context_mode: String,
+    pub fork_context: bool,
+    pub prefix_cache: SubAgentPrefixCacheProjection,
+    pub transcript_handle: VarHandle,
+    pub snapshot: SubAgentResult,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgentPrefixCacheProjection {
+    pub mode: String,
+    pub parent_prefix: String,
+    pub deepseek_prefix_cache_reuse: String,
+}
+
+fn subagent_prefix_cache_projection(snapshot: &SubAgentResult) -> SubAgentPrefixCacheProjection {
+    if snapshot.fork_context {
+        SubAgentPrefixCacheProjection {
+            mode: "forked".to_string(),
+            parent_prefix: "preserved_byte_identical_when_available".to_string(),
+            deepseek_prefix_cache_reuse: "optimized_for_existing_parent_prefill".to_string(),
+        }
+    } else {
+        SubAgentPrefixCacheProjection {
+            mode: "fresh".to_string(),
+            parent_prefix: "not_inherited".to_string(),
+            deepseek_prefix_cache_reuse: "independent_child_prefill".to_string(),
+        }
+    }
+}
+
+async fn subagent_session_projection(
+    snapshot: SubAgentResult,
+    timed_out: bool,
+    context: &ToolContext,
+) -> SubAgentSessionProjection {
+    let transcript_session_id = format!("agent:{}", snapshot.agent_id);
+    let transcript_payload = json!({
+        "kind": "subagent_session_snapshot",
+        "agent_id": snapshot.agent_id.clone(),
+        "name": snapshot.name.clone(),
+        "status": subagent_status_name(&snapshot.status),
+        "context_mode": snapshot.context_mode.clone(),
+        "fork_context": snapshot.fork_context,
+        "result": snapshot.result.clone(),
+        "steps_taken": snapshot.steps_taken,
+        "duration_ms": snapshot.duration_ms,
+        "assignment": snapshot.assignment.clone(),
+        "snapshot": snapshot.clone(),
+    });
+    let transcript_handle = {
+        let mut store = context.runtime.handle_store.lock().await;
+        let full_transcript_lookup = VarHandle {
+            kind: "var_handle".to_string(),
+            session_id: transcript_session_id.clone(),
+            name: "full_transcript".to_string(),
+            type_name: String::new(),
+            length: 0,
+            repr_preview: String::new(),
+            sha256: String::new(),
+        };
+        if snapshot.status != SubAgentStatus::Running
+            && let Some(record) = store.get(&full_transcript_lookup)
+        {
+            record.handle.clone()
+        } else {
+            store.insert_json(transcript_session_id, "transcript", transcript_payload)
+        }
+    };
+
+    SubAgentSessionProjection {
+        name: snapshot.name.clone(),
+        agent_id: snapshot.agent_id.clone(),
+        status: subagent_status_name(&snapshot.status).to_string(),
+        terminal: snapshot.status != SubAgentStatus::Running,
+        context_mode: snapshot.context_mode.clone(),
+        fork_context: snapshot.fork_context,
+        prefix_cache: subagent_prefix_cache_projection(&snapshot),
+        transcript_handle,
+        snapshot,
+        timed_out,
+    }
+}
+
 fn default_state_path(workspace: &Path) -> PathBuf {
+    // Prefer .codewhale, fall back to .deepseek for project-local state
+    let primary = workspace.join(".codewhale").join("state");
+    if primary.exists() {
+        return primary.join(SUBAGENT_STATE_FILE);
+    }
     workspace
         .join(".deepseek")
         .join("state")
@@ -1474,12 +1887,269 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
     let state_path = default_state_path(&workspace);
     let mut manager = SubAgentManager::new(workspace, max_agents).with_state_path(state_path);
     if let Err(err) = manager.load_state() {
-        eprintln!("Failed to load sub-agent state: {err}");
+        // Routed through tracing instead of stderr — see comment in
+        // `persist_state_best_effort` above.
+        tracing::warn!(target: "subagent", ?err, "failed to load sub-agent state");
     }
     Arc::new(RwLock::new(manager))
 }
 
 // === Tool Implementations ===
+
+/// Open a named background sub-agent session.
+#[allow(dead_code)] // Registered by the adjacent v0.8.33 registry surface update.
+pub struct AgentOpenTool {
+    manager: SharedSubAgentManager,
+    runtime: SubAgentRuntime,
+}
+
+impl AgentOpenTool {
+    #[allow(dead_code)] // Registered by the adjacent v0.8.33 registry surface update.
+    #[must_use]
+    pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
+        Self { manager, runtime }
+    }
+}
+
+#[async_trait]
+impl ToolSpec for AgentOpenTool {
+    fn name(&self) -> &'static str {
+        "agent_open"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "Open a named child sub-agent session for focused background work. Returns the session name, status, agent_id, context_mode, prefix_cache metadata, and a handle_read-compatible transcript_handle. ",
+            "Use agent_eval to fetch or wait on the session, and agent_close to cancel/close it.\n\n",
+            "Context control is explicit: omit fork_context or set it false for a fresh child with an independent prefill; set fork_context=true for perspective fanout over the current parent context. ",
+            "Forked children preserve the parent system prompt and leading message prefix byte-identically where the runtime has that prefix, so DeepSeek can reuse its prefix cache before the child-specific task is appended.\n\n",
+            "Sub-agent results are self-reports. Re-verify claimed side effects such as file edits, commands, network writes, tests, or git operations before reporting them as facts."
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Stable model-facing session name. Defaults to the generated agent_id when omitted."
+                },
+                "session_name": {
+                    "type": "string",
+                    "description": "Alias for name"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Initial task description for the child session"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Alias for prompt"
+                },
+                "objective": {
+                    "type": "string",
+                    "description": "Alias for prompt"
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Structured input items (text, mention, skill, local_image, image)",
+                    "items": { "type": "object" }
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Sub-agent type: general, explore, plan, review, implementer, verifier, custom"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "description": "Alias for type"
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Role alias: worker, explorer, awaiter, default"
+                },
+                "agent_role": {
+                    "type": "string",
+                    "description": "Alias for role"
+                },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Explicit tool allowlist (required for custom type)"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional DeepSeek model id for this child"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory for the child; must be inside the parent workspace"
+                },
+                "resident_file": {
+                    "type": "string",
+                    "description": "Optional file path for cache-aware resident mode"
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "false (default): fresh child with independent context/prefill. true: forked child that preserves the parent's byte-identical system/message prefix where available, then appends this task for DeepSeek prefix-cache reuse."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "Recursive child-agent budget for this session. 0 blocks agent_open from the child; 1-3 allow that many descendant levels."
+                }
+            }
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![
+            ToolCapability::ExecutesCode,
+            ToolCapability::RequiresApproval,
+        ]
+    }
+
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Required
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let spawn_tool = AgentSpawnTool::new(self.manager.clone(), self.runtime.clone());
+        let result = spawn_tool.execute(input, context).await?;
+        let snapshot: SubAgentResult = serde_json::from_str(&result.content).map_err(|e| {
+            ToolError::execution_failed(format!("agent_open projection failed: {e}"))
+        })?;
+        let projection = subagent_session_projection(snapshot, false, context).await;
+        let mut tool_result = ToolResult::json(&projection)
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        tool_result.metadata = Some(json!({
+            "status": projection.status,
+            "terminal": projection.terminal,
+            "context_mode": projection.context_mode,
+            "prefix_cache": projection.prefix_cache,
+        }));
+        Ok(tool_result)
+    }
+}
+
+/// Open a fast, non-thinking Flash V4 execution agent.
+///
+/// This is deliberately a thin wrapper over the durable `agent_open` runtime:
+/// cost accounting, mailbox updates, transcript handles, cancellation, and
+/// `agent_eval`/`agent_close` all stay on the same path.
+pub struct ToolAgentTool {
+    manager: SharedSubAgentManager,
+    runtime: SubAgentRuntime,
+}
+
+impl ToolAgentTool {
+    #[must_use]
+    pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
+        Self { manager, runtime }
+    }
+}
+
+#[async_trait]
+impl ToolSpec for ToolAgentTool {
+    fn name(&self) -> &'static str {
+        "tool_agent"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "Open an experimental fast-lane execution agent (Fin): DeepSeek V4 Flash with thinking forced off. ",
+            "Use it for simple tool-bound work such as OCR, file/search lookups, fetches, or command probes where the parent model should keep planning and synthesis context clean. ",
+            "Returns the same session projection as agent_open; use agent_eval to fetch/wait and agent_close to close it. ",
+            "Do not use this for nuanced implementation, architecture, release decisions, or tasks that need careful reasoning."
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Stable model-facing session name. Defaults to the generated agent_id when omitted."
+                },
+                "session_name": {
+                    "type": "string",
+                    "description": "Alias for name"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Initial tool-bound task for the fast execution agent"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Alias for prompt"
+                },
+                "objective": {
+                    "type": "string",
+                    "description": "Alias for prompt"
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Structured input items (text, mention, skill, local_image, image)",
+                    "items": { "type": "object" }
+                },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional explicit tool allowlist for this executor"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory for the child; must be inside the parent workspace"
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "Defaults to false. Set true only when the executor needs the parent prefix."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "Recursive child-agent budget. Defaults to 0 for tool_agent."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![
+            ToolCapability::ExecutesCode,
+            ToolCapability::RequiresApproval,
+        ]
+    }
+
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Required
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let mut forwarded = input;
+        let object = forwarded.as_object_mut().ok_or_else(|| {
+            ToolError::invalid_input("tool_agent input must be an object".to_string())
+        })?;
+        object.insert("type".to_string(), Value::String("tool-agent".to_string()));
+        object.remove("model");
+        object.remove("agent_type");
+        object.remove("agent_name");
+        object.remove("role");
+        object.remove("agent_role");
+        object
+            .entry("fork_context".to_string())
+            .or_insert(Value::Bool(false));
+        object.entry("max_depth".to_string()).or_insert(json!(0));
+
+        AgentOpenTool::new(self.manager.clone(), self.runtime.clone())
+            .execute(forwarded, context)
+            .await
+    }
+}
 
 /// Tool to spawn a background sub-agent.
 pub struct AgentSpawnTool {
@@ -1517,11 +2187,13 @@ impl ToolSpec for AgentSpawnTool {
     }
 
     fn description(&self) -> &'static str {
-        "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; \
-         follow with agent_result to retrieve the final result. Default cap of 10 concurrent \
-         sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent \
-         loop, so cancel or wait if you hit the cap. For parallel one-shot LLM queries, just \
-         emit multiple tool calls in one turn — the dispatcher runs them in parallel."
+        concat!(
+            "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; follow with agent_result to retrieve the final result. Default cap of 10 concurrent sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent loop, so cancel or wait if you hit the cap. For parallel one-shot LLM queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel.\n\n",
+            "## Trust model: subagent results are self-reports, not verified facts\n\n",
+            "`agent_result` returns the child's narrative summary of what happened. For operations with external side effects, the child's summary may be wrong. Re-verify before reporting success to the user:\n\n",
+            "| Side effect | Re-verify with |\n|---|---|\n| URL claimed posted/written | `fetch_url` and check the response |\n| File claimed created | `read_file` or `list_dir` |\n| File claimed edited | `read_file` and check the change is present |\n| HTTP POST/PUT response | inspect status code and body |\n| Git operation | `git_status` / `git_diff` |\n| Test claimed passing | `run_tests` |\n| Process claimed started | `exec_shell` (e.g. `pgrep`, `lsof -i`) |\n\n",
+            "If the child returns a verifiable handle (URL, file path, exit code, commit SHA), check it. If it doesn't, ask the child to return one or verify yourself before proceeding."
+        )
     }
 
     fn input_schema(&self) -> Value {
@@ -1570,7 +2242,7 @@ impl ToolSpec for AgentSpawnTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Explicit tool allowlist (required for custom type). Default behavior is full registry inheritance from the parent."
+                    "description": "Explicit tool allowlist (required for custom type). Default behavior is full registry inheritance from the parent; approval-gated tools still require an auto-approved parent."
                 },
                 "model": {
                     "type": "string",
@@ -1583,6 +2255,10 @@ impl ToolSpec for AgentSpawnTool {
                 "resident_file": {
                     "type": "string",
                     "description": "Optional file path for cache-aware resident mode. When set, the child's system prefix is augmented with the full contents of this file so DeepSeek's prefix cache stays warm across follow-up send_input calls. Only one agent may hold a resident lease on a given file at a time — a second spawn with the same path receives a conflict warning in the result."
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "When true, inherit the parent's system prompt and conversation prefix before appending this task. This preserves DeepSeek prefix-cache reuse and gives the child full parent context. Defaults to false for independent exploration."
                 }
             }
         })
@@ -1644,10 +2320,13 @@ impl ToolSpec for AgentSpawnTool {
         };
 
         // Derive the child's runtime as a durable background job: it keeps
-        // its own cancellation token, forces auto_approve, and optionally
-        // overrides cwd if the caller passed one (used for the parallel-
-        // worktree pattern).
+        // its own cancellation token, inherits the parent approval state, and
+        // optionally overrides cwd if the caller passed one (used for the
+        // parallel-worktree pattern).
         let mut child_runtime = self.runtime.background_runtime();
+        if let Some(max_depth) = spawn_request.max_depth {
+            child_runtime.max_spawn_depth = child_runtime.spawn_depth.saturating_add(max_depth);
+        }
         if let Some(cwd) = validated_cwd {
             child_runtime.context.workspace = cwd;
         }
@@ -1694,9 +2373,13 @@ impl ToolSpec for AgentSpawnTool {
                 (spawn_request.prompt, None)
             };
 
-        let route =
-            resolve_subagent_assignment_route(&self.runtime, configured_model, &effective_prompt)
-                .await;
+        let route = resolve_subagent_assignment_route(
+            &self.runtime,
+            configured_model,
+            &effective_prompt,
+            &spawn_request.agent_type,
+        )
+        .await;
         child_runtime.model = route.model.clone();
         child_runtime.reasoning_effort = route.reasoning_effort.clone();
         child_runtime.reasoning_effort_auto = false;
@@ -1713,8 +2396,10 @@ impl ToolSpec for AgentSpawnTool {
                 spawn_request.assignment,
                 spawn_request.allowed_tools,
                 SubAgentSpawnOptions {
+                    name: spawn_request.session_name.clone(),
                     model: Some(effective_model),
                     nickname: None,
+                    fork_context: spawn_request.fork_context,
                 },
             )
             .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
@@ -1765,13 +2450,168 @@ impl ToolSpec for AgentSpawnTool {
     }
 }
 
+/// Evaluate/fetch a child session boundary for the v0.8.33 sub-agent API.
+#[allow(dead_code)] // Registered by the adjacent v0.8.33 registry surface update.
+pub struct AgentEvalTool {
+    manager: SharedSubAgentManager,
+}
+
+impl AgentEvalTool {
+    #[allow(dead_code)] // Registered by the adjacent v0.8.33 registry surface update.
+    #[must_use]
+    pub fn new(manager: SharedSubAgentManager) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl ToolSpec for AgentEvalTool {
+    fn name(&self) -> &'static str {
+        "agent_eval"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fetch or wait on a child sub-agent session. Optionally deliver a message/items to a running session, then return the latest session projection. With block=true (default), waits for the session to reach a terminal boundary; block=false is a non-blocking status fetch. Terminal projections expose a handle_read-compatible transcript_handle for the full child transcript."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Session name returned by agent_open"
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Generated agent id returned by agent_open"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Alias for agent_id"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Optional message to deliver before evaluating the session"
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Alias for message"
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Structured input items (text, mention, skill, local_image, image)",
+                    "items": { "type": "object" }
+                },
+                "interrupt": {
+                    "type": "boolean",
+                    "description": "When sending input, prioritize it over pending inputs"
+                },
+                "block": {
+                    "type": "boolean",
+                    "description": "Wait for a terminal boundary before returning (default true)"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Max wait time in milliseconds (default: 30000, clamped to 1000-3600000)"
+                }
+            }
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![ToolCapability::ReadOnly]
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let agent_ref = input
+            .get("name")
+            .or_else(|| input.get("agent_id"))
+            .or_else(|| input.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::missing_field("name"))?;
+        let message = parse_optional_text_or_items(&input, &["message", "input"], "items")?;
+        let interrupt = optional_bool(&input, "interrupt", false);
+        let block = optional_bool(&input, "block", true);
+        let timeout_ms = optional_u64(&input, "timeout_ms", DEFAULT_RESULT_TIMEOUT_MS)
+            .clamp(1000, MAX_RESULT_TIMEOUT_MS);
+
+        let agent_id = {
+            let manager = self.manager.read().await;
+            manager
+                .resolve_agent_ref(agent_ref)
+                .map_err(|e| ToolError::execution_failed(e.to_string()))?
+        };
+
+        // Track whether a supplied follow-up message actually reached the
+        // child. A completed/failed/cancelled session cannot accept input, but
+        // that must NOT abort the whole call: the parent still needs the
+        // session projection (and its `transcript_handle`) to retrieve the
+        // child's full output. Hard-failing here was #1738 — "agent_eval on a
+        // completed session returns 'not running', no way to recover the full
+        // child output".
+        let mut message_delivery: Option<Value> = None;
+        if let Some(message) = message {
+            let terminal = {
+                let manager = self.manager.read().await;
+                manager
+                    .get_result(&agent_id)
+                    .map(|snap| snap.status != SubAgentStatus::Running)
+                    .unwrap_or(false)
+            };
+            if terminal {
+                message_delivery = Some(json!({
+                    "delivered": false,
+                    "reason": "session already terminated; follow-up not delivered",
+                    "recover_full_output": "read the returned transcript_handle with handle_read"
+                }));
+            } else {
+                let mut manager = self.manager.write().await;
+                manager
+                    .send_input(&agent_id, message, interrupt)
+                    .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+                message_delivery = Some(json!({ "delivered": true }));
+            }
+        }
+
+        let (snapshot, timed_out) = if block {
+            wait_for_result(&self.manager, &agent_id, Duration::from_millis(timeout_ms)).await?
+        } else {
+            let manager = self.manager.read().await;
+            (
+                manager
+                    .get_result(&agent_id)
+                    .map_err(|e| ToolError::execution_failed(e.to_string()))?,
+                false,
+            )
+        };
+
+        let projection = subagent_session_projection(snapshot, timed_out, context).await;
+        let mut result = ToolResult::json(&projection)
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        result.metadata = Some(json!({
+            "status": if timed_out { "TimedOut".to_string() } else { projection.status.clone() },
+            "timed_out": timed_out,
+            "terminal": projection.terminal,
+            "context_mode": projection.context_mode,
+            "timeout_ms": timeout_ms,
+            "message_delivery": message_delivery
+        }));
+        Ok(result)
+    }
+}
+
 /// Tool to fetch a sub-agent's result.
+#[allow(dead_code)] // Legacy surface superseded by agent_eval.
 pub struct AgentResultTool {
     manager: SharedSubAgentManager,
 }
 
 impl AgentResultTool {
     /// Create a new result tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_eval.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager) -> Self {
         Self { manager }
@@ -1855,12 +2695,14 @@ impl ToolSpec for AgentResultTool {
 }
 
 /// Tool to cancel a sub-agent.
+#[allow(dead_code)] // Legacy surface superseded by agent_close.
 pub struct AgentCancelTool {
     manager: SharedSubAgentManager,
 }
 
 impl AgentCancelTool {
     /// Create a new cancel tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_close.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager) -> Self {
         Self { manager }
@@ -1913,6 +2755,7 @@ impl ToolSpec for AgentCancelTool {
 }
 
 /// Tool to list all sub-agents.
+#[allow(dead_code)] // Legacy surface superseded by named agent_open/eval/close sessions.
 pub struct AgentListTool {
     manager: SharedSubAgentManager,
 }
@@ -1933,11 +2776,11 @@ impl AgentCloseTool {
 #[async_trait]
 impl ToolSpec for AgentCloseTool {
     fn name(&self) -> &'static str {
-        "close_agent"
+        "agent_close"
     }
 
     fn description(&self) -> &'static str {
-        "Close a running sub-agent. Alias for agent_cancel."
+        "Close a child sub-agent session by cancelling it if still running. Returns the final session projection with transcript_handle metadata."
     }
 
     fn input_schema(&self) -> Value {
@@ -1946,7 +2789,11 @@ impl ToolSpec for AgentCloseTool {
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": "Agent id returned by agent_spawn"
+                    "description": "Agent id returned by agent_open"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Session name returned by agent_open"
                 },
                 "agent_id": {
                     "type": "string",
@@ -1967,27 +2814,30 @@ impl ToolSpec for AgentCloseTool {
         ApprovalRequirement::Required
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let agent_id = input
-            .get("id")
+            .get("name")
+            .or_else(|| input.get("id"))
             .or_else(|| input.get("agent_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::missing_field("id"))?;
+        let agent_id = {
+            let manager = self.manager.read().await;
+            manager
+                .resolve_agent_ref(agent_id)
+                .map_err(|e| ToolError::execution_failed(e.to_string()))?
+        };
         let mut manager = self.manager.write().await;
         let result = manager
-            .cancel(agent_id)
+            .cancel(&agent_id)
             .map_err(|e| ToolError::execution_failed(format!("Failed to close sub-agent: {e}")))?;
-        let tool_result =
-            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        Ok(wrap_with_deprecation_notice(
-            tool_result,
-            "close_agent",
-            "agent_cancel",
-        ))
+        let projection = subagent_session_projection(result, false, context).await;
+        ToolResult::json(&projection).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
 /// Tool to resume an existing sub-agent.
+#[allow(dead_code)] // Legacy surface superseded by agent_open/eval.
 pub struct AgentResumeTool {
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
@@ -1995,6 +2845,7 @@ pub struct AgentResumeTool {
 
 impl AgentResumeTool {
     /// Create a new resume tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_open/eval.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
         Self { manager, runtime }
@@ -2054,6 +2905,7 @@ impl ToolSpec for AgentResumeTool {
 
 impl AgentListTool {
     /// Create a new list tool.
+    #[allow(dead_code)] // Legacy surface superseded by named agent_open/eval/close sessions.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager) -> Self {
         Self { manager }
@@ -2103,6 +2955,7 @@ impl ToolSpec for AgentListTool {
 }
 
 /// Tool to send input to a running sub-agent.
+#[allow(dead_code)] // Legacy surface superseded by agent_eval.
 pub struct AgentSendInputTool {
     manager: SharedSubAgentManager,
     name: &'static str,
@@ -2110,6 +2963,7 @@ pub struct AgentSendInputTool {
 
 impl AgentSendInputTool {
     /// Create a new send-input tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_eval.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, name: &'static str) -> Self {
         Self { manager, name }
@@ -2199,6 +3053,7 @@ impl ToolSpec for AgentSendInputTool {
 }
 
 /// Tool to update assignment metadata for a sub-agent.
+#[allow(dead_code)] // Legacy surface superseded by agent_eval/open metadata.
 pub struct AgentAssignTool {
     manager: SharedSubAgentManager,
     name: &'static str,
@@ -2206,6 +3061,7 @@ pub struct AgentAssignTool {
 
 impl AgentAssignTool {
     /// Create a new assignment tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_eval/open metadata.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, name: &'static str) -> Self {
         Self { manager, name }
@@ -2293,6 +3149,7 @@ impl ToolSpec for AgentAssignTool {
 }
 
 /// Tool to wait for sub-agents to complete.
+#[allow(dead_code)] // Legacy surface superseded by agent_eval.
 pub struct AgentWaitTool {
     manager: SharedSubAgentManager,
     name: &'static str,
@@ -2300,6 +3157,7 @@ pub struct AgentWaitTool {
 
 impl AgentWaitTool {
     /// Create a new wait tool.
+    #[allow(dead_code)] // Legacy surface superseded by agent_eval.
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, name: &'static str) -> Self {
         Self { manager, name }
@@ -2437,7 +3295,9 @@ impl ToolSpec for AgentWaitTool {
     }
 }
 
-/// Tool to delegate a task to a specialized agent (alias for agent_spawn).
+/// Compatibility delegate tool. It routes through `agent_spawn`, but defaults
+/// to `fork_context=true` because delegation is usually continuation work.
+#[allow(dead_code)] // Legacy alias superseded by agent_open(fork_context=true).
 pub struct DelegateToAgentTool {
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
@@ -2445,6 +3305,7 @@ pub struct DelegateToAgentTool {
 
 impl DelegateToAgentTool {
     /// Create a new delegation tool.
+    #[allow(dead_code)] // Legacy alias superseded by agent_open(fork_context=true).
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
         Self { manager, runtime }
@@ -2458,8 +3319,9 @@ impl ToolSpec for DelegateToAgentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a task to a specialized sub-agent. This is an alias for agent_spawn — same schema, \
-         same behavior. Use `type` (or `agent_name`, `agent_type`) to pick the agent flavor."
+        "Delegate a task to a specialized sub-agent. Compatibility wrapper around agent_spawn; \
+         defaults fork_context=true so the child inherits the parent transcript. Use `type` \
+         (or `agent_name`, `agent_type`) to pick the agent flavor."
     }
 
     fn input_schema(&self) -> Value {
@@ -2509,6 +3371,10 @@ impl ToolSpec for DelegateToAgentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Explicit tool allowlist (required for custom type)"
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "When true, inherit the parent's system prompt and conversation prefix before appending this task. delegate_to_agent defaults this to true."
                 }
             }
         })
@@ -2527,6 +3393,7 @@ impl ToolSpec for DelegateToAgentTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let spawn_tool = AgentSpawnTool::new(self.manager.clone(), self.runtime.clone());
+        let input = with_default_fork_context(input, true);
         let result = spawn_tool.execute(input, context).await?;
         Ok(wrap_with_deprecation_notice(
             result,
@@ -2563,6 +3430,64 @@ fn build_subagent_system_prompt(
     }
 }
 
+fn subagent_request_system_prompt(
+    subagent_system_prompt: &str,
+    fork_context: Option<&SubAgentForkContext>,
+) -> SystemPrompt {
+    fork_context
+        .and_then(|context| context.system.clone())
+        .unwrap_or_else(|| SystemPrompt::Text(subagent_system_prompt.to_string()))
+}
+
+fn build_initial_subagent_messages(
+    prompt: &str,
+    assignment: &SubAgentAssignment,
+    agent_type: &SubAgentType,
+    fork_context: Option<&SubAgentForkContext>,
+) -> Vec<Message> {
+    let mut messages = fork_context
+        .map(|context| context.messages.clone())
+        .unwrap_or_default();
+
+    if let Some(context) = fork_context {
+        if let Some(state) = context
+            .structured_state_block
+            .as_deref()
+            .map(str::trim)
+            .filter(|state| !state.is_empty())
+        {
+            messages.push(system_text_message(format!(
+                "<codewhale:fork_state>\n{state}\n</codewhale:fork_state>"
+            )));
+        }
+
+        messages.push(system_text_message(format!(
+            "<codewhale:subagent_context>\n{}\n</codewhale:subagent_context>",
+            build_subagent_system_prompt(agent_type, assignment)
+        )));
+    }
+
+    messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: build_assignment_prompt(prompt, assignment, agent_type),
+            cache_control: None,
+        }],
+    });
+
+    messages
+}
+
+fn system_text_message(text: String) -> Message {
+    Message {
+        role: "system".to_string(),
+        content: vec![ContentBlock::Text {
+            text,
+            cache_control: None,
+        }],
+    }
+}
+
 struct SubAgentTask {
     manager_handle: SharedSubAgentManager,
     runtime: SubAgentRuntime,
@@ -2571,7 +3496,9 @@ struct SubAgentTask {
     prompt: String,
     assignment: SubAgentAssignment,
     /// `None` = full registry inheritance. `Some(list)` = explicit narrow.
+    /// Approval-gated tools still require an auto-approved parent runtime.
     allowed_tools: Option<Vec<String>>,
+    fork_context: bool,
     started_at: Instant,
     max_steps: u32,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
@@ -2586,23 +3513,18 @@ async fn run_subagent_task(task: SubAgentTask) {
         task.prompt,
         task.assignment,
         task.allowed_tools,
+        task.fork_context,
         task.started_at,
         task.max_steps,
         task.input_rx,
     )
     .await;
 
-    let mut manager = task.manager_handle.write().await;
-    match &result {
-        Ok(res) => manager.update_from_result(&task.agent_id, res.clone()),
-        Err(err) => manager.update_failed(&task.agent_id, err.to_string()),
-    }
-
     // Emit BOTH a human-friendly summary (rendered in the parent's
     // sidebar / cell) AND a structured sentinel the model can recognize
     // on its next turn. Format: human summary on the first line,
     // sentinel on the second. The sentinel uses an opaque tag
-    // (`deepseek:subagent.done`) to avoid collision with normal user
+    // (`codewhale:subagent.done`) to avoid collision with normal user
     // text.
     let (summary, sentinel) = match &result {
         Ok(res) => (
@@ -2629,39 +3551,113 @@ async fn run_subagent_task(task: SubAgentTask) {
         let _ = mb.send(envelope);
     }
 
+    let payload = format!("{summary}\n{sentinel}");
+    let agent_id = task.agent_id.clone();
+
+    // Wake the engine's parent turn loop if this is one of its direct
+    // children (issue #756). Issue #1961 also requires emit to happen
+    // before marking the manager terminal state so the parent can observe the
+    // completion while its "running children" gate is still open. If we
+    // update first, the parent can finalize before the completion arrives.
+    emit_parent_completion(&task.runtime, &agent_id, &payload);
+
+    let mut manager = task.manager_handle.write().await;
+    match &result {
+        Ok(res) => manager.update_from_result(&agent_id, res.clone()),
+        Err(err) => manager.update_failed(&agent_id, err.to_string()),
+    }
+
     if let Some(event_tx) = task.runtime.event_tx {
-        let payload = format!("{summary}\n{sentinel}");
         let _ = event_tx.try_send(Event::AgentComplete {
-            id: task.agent_id,
+            id: agent_id.clone(),
             result: payload,
         });
     }
 }
 
-/// Build a `<deepseek:subagent.done>` JSON sentinel for a successful child.
+/// Notify the engine's parent turn loop that a direct child finished
+/// (issue #756). Returns `true` if a send was attempted, `false` if the
+/// notification was skipped because this isn't a direct child or no channel
+/// is wired. Skips silently when the channel sender has no receiver — the
+/// engine outlives the runtime, so a dropped receiver means we're shutting
+/// down anyway.
+pub(crate) fn emit_parent_completion(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    payload: &str,
+) -> bool {
+    if runtime.spawn_depth != 1 {
+        return false;
+    }
+    let Some(tx) = runtime.parent_completion_tx.as_ref() else {
+        return false;
+    };
+    let _ = tx.send(SubAgentCompletion {
+        agent_id: agent_id.to_string(),
+        payload: payload.to_string(),
+    });
+    true
+}
+
+/// Build a `<codewhale:subagent.done>` JSON sentinel for a successful child.
 /// Intended to surface in the parent's transcript so the model recognizes
 /// child completion and can decide whether to read the full result via
-/// `agent_result`.
+/// `agent_eval`.
+///
+/// Keep this payload deliberately lean. The human summary is emitted on the
+/// line immediately before the sentinel; duplicating it here bloats the next
+/// parent request's cache-miss tail. Wall-clock duration is useful UI
+/// telemetry, but it is volatile and not useful for model coordination.
 fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
     let payload = json!({
         "agent_id": agent_id,
         "agent_type": res.agent_type.as_str(),
         "status": subagent_status_name(&res.status),
-        "duration_ms": res.duration_ms,
-        "steps": res.steps_taken,
-        "summary": summarize_subagent_result(res),
+        "summary_location": "previous_line",
+        "details": "agent_eval",
     });
-    format!("<deepseek:subagent.done>{payload}</deepseek:subagent.done>")
+    format!("<codewhale:subagent.done>{payload}</codewhale:subagent.done>")
 }
 
-/// Build a `<deepseek:subagent.done>` sentinel for a failed child.
-fn subagent_failed_sentinel(agent_id: &str, err: &str) -> String {
+/// Build a `<codewhale:subagent.done>` sentinel for a failed child.
+fn subagent_failed_sentinel(agent_id: &str, _err: &str) -> String {
     let payload = json!({
         "agent_id": agent_id,
         "status": "failed",
-        "error": err,
+        "error_location": "previous_line",
+        "details": "agent_eval",
     });
-    format!("<deepseek:subagent.done>{payload}</deepseek:subagent.done>")
+    format!("<codewhale:subagent.done>{payload}</codewhale:subagent.done>")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_subagent_full_transcript_handle(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    agent_type: &SubAgentType,
+    assignment: &SubAgentAssignment,
+    status: &SubAgentStatus,
+    result: Option<&String>,
+    messages: &[Message],
+    steps_taken: u32,
+    duration_ms: u64,
+    fork_context: bool,
+) -> VarHandle {
+    let payload = json!({
+        "kind": "subagent_full_transcript",
+        "agent_id": agent_id,
+        "agent_type": agent_type.as_str(),
+        "status": subagent_status_name(status),
+        "context_mode": if fork_context { "forked" } else { "fresh" },
+        "fork_context": fork_context,
+        "result": result,
+        "steps_taken": steps_taken,
+        "duration_ms": duration_ms,
+        "assignment": assignment,
+        "messages": messages,
+    });
+    let mut store = runtime.context.runtime.handle_store.lock().await;
+    store.insert_json(format!("agent:{agent_id}"), "full_transcript", payload)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2672,13 +3668,27 @@ async fn run_subagent(
     prompt: String,
     assignment: SubAgentAssignment,
     allowed_tools: Option<Vec<String>>,
+    fork_context: bool,
     started_at: Instant,
     max_steps: u32,
     mut input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
 ) -> Result<SubAgentResult> {
     let system_prompt = build_subagent_system_prompt(&agent_type, &assignment);
+    let fork_context_enabled = fork_context;
+    let fork_context = fork_context_enabled
+        .then_some(runtime.fork_context.as_ref())
+        .flatten();
+    let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
+    let mut messages =
+        build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
+    let runtime_for_tools = runtime.clone().with_fork_context(SubAgentForkContext {
+        system: Some(request_system.clone()),
+        messages: messages.clone(),
+        structured_state_block: None,
+    });
     let tool_registry = SubAgentToolRegistry::new(
-        runtime.clone(),
+        runtime_for_tools,
+        agent_type.clone(),
         allowed_tools.clone(),
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -2690,7 +3700,7 @@ async fn run_subagent(
             unavailable_tools.join(", ")
         ));
     }
-    let tools = tool_registry.tools_for_model();
+    let tools = tool_registry.tools_for_model(&agent_type);
     if let Some(mb) = runtime.mailbox.as_ref() {
         let _ = mb.send(MailboxMessage::started(&agent_id, agent_type.clone()));
     }
@@ -2701,22 +3711,14 @@ async fn run_subagent(
         format!("started ({})", agent_type.as_str()),
     );
 
-    let mut messages = vec![Message {
-        role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: build_assignment_prompt(&prompt, &assignment, &agent_type),
-            cache_control: None,
-        }],
-    }];
-
     let mut steps = 0;
     let mut final_result: Option<String> = None;
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
 
     for _step in 0..max_steps {
-        // Cooperative cancellation: bail if the parent (or root) cancelled
-        // us while we were between steps. Children derive their token from
-        // the parent's via `child_token()` so this propagates the whole tree.
+        // Cooperative cancellation: bail if this session's token was cancelled
+        // while we were between steps. Top-level model-visible sub-agents use
+        // a detached token so parent turn cancellation does not stop them.
         if runtime.cancel_token.is_cancelled() {
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
@@ -2729,16 +3731,39 @@ async fn run_subagent(
                     agent_id: agent_id.clone(),
                 });
             }
+            let status = SubAgentStatus::Cancelled;
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            insert_subagent_full_transcript_handle(
+                runtime,
+                &agent_id,
+                &agent_type,
+                &assignment,
+                &status,
+                None,
+                &messages,
+                steps,
+                duration_ms,
+                fork_context_enabled,
+            )
+            .await;
             return Ok(SubAgentResult {
+                name: agent_id.clone(),
                 agent_id: agent_id.clone(),
+                context_mode: if fork_context_enabled {
+                    "forked"
+                } else {
+                    "fresh"
+                }
+                .to_string(),
+                fork_context: fork_context_enabled,
                 agent_type: agent_type.clone(),
                 assignment: assignment.clone(),
                 model: runtime.model.clone(),
                 nickname: None,
-                status: SubAgentStatus::Cancelled,
+                status,
                 result: None,
                 steps_taken: steps,
-                duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                duration_ms,
                 from_prior_session: false,
             });
         }
@@ -2774,7 +3799,7 @@ async fn run_subagent(
             model: runtime.model.clone(),
             messages: messages.clone(),
             max_tokens: 4096,
-            system: Some(SystemPrompt::Text(system_prompt.clone())),
+            system: Some(request_system.clone()),
             tools: Some(tools.clone()),
             tool_choice: Some(json!({ "type": "auto" })),
             metadata: None,
@@ -2802,22 +3827,39 @@ async fn run_subagent(
                         agent_id: agent_id.clone(),
                     });
                 }
+                let status = SubAgentStatus::Cancelled;
+                let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                insert_subagent_full_transcript_handle(
+                    runtime,
+                    &agent_id,
+                    &agent_type,
+                    &assignment,
+                    &status,
+                    None,
+                    &messages,
+                    steps,
+                    duration_ms,
+                    fork_context_enabled,
+                )
+                .await;
                 return Ok(SubAgentResult {
+                    name: agent_id.clone(),
                     agent_id: agent_id.clone(),
+                    context_mode: if fork_context_enabled { "forked" } else { "fresh" }.to_string(),
+                    fork_context: fork_context_enabled,
                     agent_type: agent_type.clone(),
                     assignment: assignment.clone(),
                     model: runtime.model.clone(),
                     nickname: None,
-                    status: SubAgentStatus::Cancelled,
+                    status,
                     result: None,
                     steps_taken: steps,
-                    duration_ms: u64::try_from(started_at.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
+                    duration_ms,
                     from_prior_session: false,
                 });
             }
-            api = tokio::time::timeout(STEP_API_TIMEOUT, runtime.client.create_message(request)) => {
-                api.map_err(|_| anyhow!("API call timed out after {}s", STEP_API_TIMEOUT.as_secs()))??
+            api = tokio::time::timeout(runtime.step_api_timeout, runtime.client.create_message(request)) => {
+                api.map_err(|_| anyhow!("API call timed out after {}s", runtime.step_api_timeout.as_secs()))??
             }
         };
 
@@ -2938,17 +3980,40 @@ async fn run_subagent(
     }
 
     release_resident_leases_for(&agent_id);
+    let status = SubAgentStatus::Completed;
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    insert_subagent_full_transcript_handle(
+        runtime,
+        &agent_id,
+        &agent_type,
+        &assignment,
+        &status,
+        final_result.as_ref(),
+        &messages,
+        steps,
+        duration_ms,
+        fork_context_enabled,
+    )
+    .await;
 
     Ok(SubAgentResult {
+        name: agent_id.clone(),
         agent_id,
+        context_mode: if fork_context_enabled {
+            "forked"
+        } else {
+            "fresh"
+        }
+        .to_string(),
+        fork_context: fork_context_enabled,
         agent_type,
         assignment,
         model: runtime.model.clone(),
         nickname: None,
-        status: SubAgentStatus::Completed,
+        status,
         result: final_result,
         steps_taken: steps,
-        duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        duration_ms,
         from_prior_session: false,
     })
 }
@@ -2979,6 +4044,7 @@ async fn wait_for_result(
     }
 }
 
+#[allow(dead_code)] // Legacy agent_wait helper; agent_eval uses wait_for_result.
 async fn wait_for_agents(
     manager: &SharedSubAgentManager,
     ids: &[String],
@@ -3188,6 +4254,9 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         "items",
         "prompt",
     )?;
+    let session_name = optional_input_str(input, &["name", "session_name"])
+        .map(validate_session_name)
+        .transpose()?;
 
     let type_input = optional_input_str(input, &["type", "agent_type", "agent_name"]);
     let role_input = optional_input_str(input, &["role", "agent_role"]);
@@ -3260,8 +4329,31 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
+    let fork_context =
+        parse_optional_bool(input, &["fork_context", "forkContext", "inherit_context"])
+            .unwrap_or(false);
+    let max_depth = input
+        .get("max_depth")
+        .or_else(|| input.get("maxDepth"))
+        .or_else(|| input.get("max_spawn_depth"))
+        .and_then(Value::as_u64)
+        .map(|depth| {
+            u32::try_from(depth)
+                .map_err(|_| ToolError::invalid_input("max_depth must be between 0 and 3"))
+                .and_then(|depth| {
+                    if depth <= 3 {
+                        Ok(depth)
+                    } else {
+                        Err(ToolError::invalid_input(
+                            "max_depth must be between 0 and 3",
+                        ))
+                    }
+                })
+        })
+        .transpose()?;
 
     Ok(SpawnRequest {
+        session_name,
         prompt: prompt.clone(),
         agent_type,
         assignment: SubAgentAssignment::new(prompt, role),
@@ -3269,7 +4361,50 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         model,
         cwd,
         resident_file,
+        fork_context,
+        max_depth,
     })
+}
+
+fn validate_session_name(name: &str) -> Result<String, ToolError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::invalid_input("name cannot be blank"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(ToolError::invalid_input(
+            "name must not contain whitespace; use letters, numbers, '-', '_', or '.'",
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(ToolError::invalid_input(
+            "name may only contain ASCII letters, numbers, '-', '_', or '.'",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_optional_bool(input: &Value, names: &[&str]) -> Option<bool> {
+    names
+        .iter()
+        .find_map(|name| input.get(*name))
+        .and_then(Value::as_bool)
+}
+
+fn with_default_fork_context(mut input: Value, default: bool) -> Value {
+    let Some(object) = input.as_object_mut() else {
+        return input;
+    };
+    if !object.contains_key("fork_context")
+        && !object.contains_key("forkContext")
+        && !object.contains_key("inherit_context")
+    {
+        object.insert("fork_context".to_string(), Value::Bool(default));
+    }
+    input
 }
 
 pub(crate) fn normalize_requested_subagent_model(
@@ -3318,11 +4453,16 @@ pub(crate) async fn resolve_subagent_assignment_route(
     runtime: &SubAgentRuntime,
     configured_model: Option<String>,
     prompt: &str,
+    agent_type: &SubAgentType,
 ) -> SubAgentResolvedRoute {
+    if matches!(agent_type, SubAgentType::ToolAgent) {
+        return tool_agent_route();
+    }
+
     let explicit_model = configured_model.is_some();
     let mut route = fallback_subagent_assignment_route(runtime, configured_model, prompt);
 
-    if (runtime.auto_model || runtime.reasoning_effort_auto)
+    if should_use_subagent_flash_router(runtime)
         && let Ok(Some(recommendation)) = subagent_flash_router(runtime, prompt).await
     {
         if runtime.auto_model && !explicit_model {
@@ -3337,6 +4477,17 @@ pub(crate) async fn resolve_subagent_assignment_route(
     }
 
     route
+}
+
+fn tool_agent_route() -> SubAgentResolvedRoute {
+    SubAgentResolvedRoute {
+        model: "deepseek-v4-flash".to_string(),
+        reasoning_effort: Some("off".to_string()),
+    }
+}
+
+fn should_use_subagent_flash_router(runtime: &SubAgentRuntime) -> bool {
+    runtime.auto_model
 }
 
 fn fallback_subagent_assignment_route(
@@ -3412,7 +4563,7 @@ async fn subagent_flash_router(
 }
 
 const SUBAGENT_ROUTER_SYSTEM_PROMPT: &str = "\
-You are the DeepSeek TUI sub-agent routing manager. Return only compact JSON: \
+You are the codewhale sub-agent routing manager. Return only compact JSON: \
 {\"model\":\"deepseek-v4-flash|deepseek-v4-pro\",\"thinking\":\"off|high|max\"}. \
 Treat each child assignment like a customer request entering a team queue: decide the least \
 sufficient worker and thinking budget for that assignment. Do not treat being a sub-agent as \
@@ -3533,6 +4684,9 @@ fn normalize_role_alias(input: &str) -> Option<&'static str> {
         "worker" | "general" => Some("worker"),
         "explorer" | "explore" => Some("explorer"),
         "awaiter" | "plan" | "planner" => Some("awaiter"),
+        "tool-agent" | "tool_agent" | "toolagent" | "executor" | "execution" | "fin" => {
+            Some("tool_agent")
+        }
         _ => None,
     }
 }
@@ -3576,20 +4730,29 @@ fn emit_agent_progress(
 /// Two modes:
 /// - **Full inheritance** (`allowed_tools = None`): the child sees the same
 ///   tool surface as the parent's Agent mode — every tool family including
-///   `with_subagent_tools` (so it can recurse). This is the v0.6.6 default.
+///   `with_subagent_tools` (so it can recurse). Approval-gated tools are
+///   callable only when the parent runtime is auto-approved or, for explicit
+///   write-capable roles (`implementer`, `custom`), when the tool's approval
+///   requirement is `Suggest`.
 /// - **Explicit narrow** (`allowed_tools = Some(list)`): legacy / Custom
 ///   path. The registry still builds the full surface, but only the listed
 ///   tool names are visible to the model and callable.
 struct SubAgentToolRegistry {
-    /// `None` → full inheritance (no filter applied). `Some(list)` →
+    /// `None` → full inheritance (no allowlist filter applied). `Some(list)` →
     /// only the listed tools are visible to the model and callable.
     allowed_tools: Option<Vec<String>>,
+    auto_approve: bool,
+    /// The role/type of the sub-agent that this registry belongs to. Used to
+    /// decide whether `Suggest`-level tools (write/edit/patch) may run inside
+    /// the child without the parent runtime being auto-approved (#1828, #1833).
+    agent_type: SubAgentType,
     registry: ToolRegistry,
 }
 
 impl SubAgentToolRegistry {
     fn new(
         runtime: SubAgentRuntime,
+        agent_type: SubAgentType,
         explicit_allowed_tools: Option<Vec<String>>,
         todo_list: SharedTodoList,
         plan_state: SharedPlanState,
@@ -3613,8 +4776,21 @@ impl SubAgentToolRegistry {
 
         Self {
             allowed_tools: explicit_allowed_tools,
+            auto_approve: runtime.context.auto_approve,
+            agent_type,
             registry,
         }
+    }
+
+    /// Whether this role is allowed to use `Suggest`-level tools (write_file,
+    /// edit_file, apply_patch, ...) without the parent runtime being
+    /// auto-approved. Read-only stances (`explore`, `plan`, `review`,
+    /// `verifier`) stay blocked so they can't quietly mutate the workspace
+    /// while a non-auto parent is delegating bounded investigation.
+    /// `Required`-level tools (shell, etc.) still need parent auto-approve
+    /// regardless of role (#1828, #1833).
+    fn role_can_delegate_writes(agent_type: &SubAgentType) -> bool {
+        matches!(agent_type, SubAgentType::Implementer | SubAgentType::Custom)
     }
 
     /// Whether a given tool name is permitted under this child's filter.
@@ -3626,14 +4802,39 @@ impl SubAgentToolRegistry {
         }
     }
 
-    fn tools_for_model(&self) -> Vec<Tool> {
+    fn tools_for_model(&self, agent_type: &SubAgentType) -> Vec<Tool> {
+        let disallowed = match agent_type {
+            // Review and tool-executor agents should not spawn or manage
+            // sub-agents recursively (#1489, fast-lane executor).
+            SubAgentType::Review => &["agent_spawn", "agent_open", "agent_eval", "agent_close"][..],
+            SubAgentType::ToolAgent => &[
+                "agent_spawn",
+                "agent_open",
+                "agent_eval",
+                "agent_close",
+                "tool_agent",
+                "rlm_open",
+                "rlm_eval",
+                "rlm_configure",
+                "rlm_close",
+            ][..],
+            _ => &[][..],
+        };
         let api_tools = self.registry.to_api_tools();
-        match &self.allowed_tools {
+        let filtered = match &self.allowed_tools {
             None => api_tools,
             Some(list) => api_tools
                 .into_iter()
                 .filter(|tool| list.contains(&tool.name))
-                .collect(),
+                .collect::<Vec<_>>(),
+        };
+        if disallowed.is_empty() {
+            filtered
+        } else {
+            filtered
+                .into_iter()
+                .filter(|tool| !disallowed.contains(&tool.name.as_str()))
+                .collect()
         }
     }
 
@@ -3652,11 +4853,58 @@ impl SubAgentToolRegistry {
         if !self.is_tool_allowed(name) {
             return Err(anyhow!("Tool {name} not allowed for this sub-agent"));
         }
+        if !self.auto_approve {
+            let Some(spec) = self.registry.get(name) else {
+                return Err(anyhow!("Tool {name} is not registered"));
+            };
+            match spec.approval_requirement() {
+                ApprovalRequirement::Auto => {}
+                ApprovalRequirement::Suggest => {
+                    // Write/edit/patch tools land here. Explicit
+                    // write-capable roles (`implementer`, `custom`) may run them
+                    // without parent auto-approve so that delegated work
+                    // can actually land file changes; the previous
+                    // behavior blocked every write under `suggest` mode
+                    // even for the role explicitly chartered to write
+                    // (#1828, #1833). Read-only roles still bounce so
+                    // exploration/review/planning/verifier children
+                    // can't mutate the workspace behind the parent's back.
+                    if !Self::role_can_delegate_writes(&self.agent_type) {
+                        return Err(anyhow!(
+                            "Tool {name} requires approval and is not delegated to {role} sub-agents; rerun the parent with auto approval or pick a write-capable role",
+                            role = self.agent_type.as_str()
+                        ));
+                    }
+                }
+                ApprovalRequirement::Required => {
+                    return Err(anyhow!(
+                        "Tool {name} requires approval and cannot run inside this sub-agent unless the parent session is auto-approved"
+                    ));
+                }
+            }
+        }
+        reject_subagent_terminal_takeover(name, &input)?;
         self.registry
             .execute(name, input)
             .await
             .map_err(|e| anyhow!(e))
     }
+}
+
+fn reject_subagent_terminal_takeover(name: &str, input: &Value) -> Result<()> {
+    let wants_interactive_shell = name == "exec_shell"
+        && input
+            .get("interactive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if wants_interactive_shell {
+        return Err(anyhow!(
+            "Sub-agents run in the background and cannot use exec_shell with interactive=true \
+             because that would take over the parent TUI terminal. Use non-interactive \
+             exec_shell, background=true, tty=true, or task_shell_start instead."
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the effective allowed-tools list for a child.
@@ -3698,10 +4946,10 @@ fn build_allowed_tools(
         ));
     }
 
-    // Default: full registry inheritance from the parent. The child sees
-    // every tool the parent has, including the sub-agent management family
-    // (so it can recurse). Sandbox + workspace + depth cap remain the
-    // safety net.
+    // Default: full registry inheritance from the parent. The child sees every
+    // tool the parent has, including the sub-agent management family. The
+    // registry execution guard still blocks approval-gated tools unless the
+    // parent runtime is auto-approved.
     Ok(None)
 }
 
@@ -3735,179 +4983,64 @@ fn truncate_preview(text: &str) -> String {
     }
 }
 
-// === System prompts ===
-//
-// Each per-agent-type prompt is composed from two parts:
-//
-//   1. A short role-specific intro that names the agent's job, its scope,
-//      and any role-specific tactics or stop conditions.
-//   2. The shared `subagent_output_format.md` block, which is the single
-//      source of truth for the SUMMARY / EVIDENCE / CHANGES / RISKS /
-//      BLOCKERS contract, the stop condition, and the typed-tool-surface
-//      conventions. Tweaks to the contract live in that one file.
-//
-// `concat!` resolves at compile time, so the per-type constants remain
-// `&'static str` and `system_prompt()` keeps its `String` return type.
-// The `include_str!` calls inside each `concat!` all point at the same
-// file, so the format is defined once even though it's inlined many times.
+const SUBAGENT_OUTPUT_FORMAT: &str = include_str!("../../prompts/subagent_output_format.md");
 
-const GENERAL_AGENT_PROMPT: &str = concat!(
+const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\n",
-    "\n",
-    "Your scope is exactly what the parent assigned to you. Do not expand the\n",
-    "objective — if you discover related work that needs doing, surface it under\n",
-    "RISKS or BLOCKERS rather than starting it. Work autonomously: the parent is\n",
-    "not available to answer questions mid-run.\n",
-    "\n",
-    "Plan before you act. Use `checklist_write` for any multi-step task so your work\n",
-    "is visible in the parent's sidebar. For complex initiatives, layer\n",
-    "`update_plan` (strategy) above `checklist_write` (tactics).\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+    "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
+    "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n",
+    "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
+    "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
 );
 
-const EXPLORE_AGENT_PROMPT: &str = concat!(
-    "You are an exploration sub-agent. Your job is to map the relevant region\n",
-    "of the codebase fast and report what is there. You are read-only by\n",
-    "convention — do not write, patch, or run side-effectful commands. If the\n",
-    "task seems to require a write, stop and put it under BLOCKERS.\n",
-    "\n",
-    "Method:\n",
-    "- Start with `list_dir` and `file_search` to orient.\n",
-    "- Use `grep_files` (NOT `exec_shell rg`) to find call sites, type defs,\n",
-    "  and string literals. Prefer narrow, structured queries over broad scans.\n",
-    "- Read each candidate file with `read_file`. Skim, then quote line ranges.\n",
-    "- Stop reading once you have enough evidence — exhaustive sweeps are not\n",
-    "  the goal. The parent will spawn a follow-up explorer if needed.\n",
-    "\n",
-    "EVIDENCE is the load-bearing section for explorers. Cite every file you\n",
-    "read with `path:line-range` and one line per finding. The parent uses your\n",
-    "EVIDENCE list as a working set for the next turn, so be precise.\n",
-    "\n",
-    "CHANGES will almost always be \"None.\" for an explorer.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const EXPLORE_AGENT_INTRO: &str = concat!(
+    "You are an exploration sub-agent (role: `explore`). Map the relevant code quickly and stay read-only.\n",
+    "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
+    "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
+    "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient.\n",
+    "CHANGES will almost always be \"None.\" for an explorer.\n\n"
 );
 
-const PLAN_AGENT_PROMPT: &str = concat!(
-    "You are a planning sub-agent. Your job is to take an objective and\n",
-    "produce a prioritized, executable plan — not to execute it. Keep writes\n",
-    "to a minimum (notes and plan artifacts only); avoid patches and shell\n",
-    "side effects.\n",
-    "\n",
-    "Method:\n",
-    "- Read enough of the codebase to ground the plan in reality. A plan\n",
-    "  written without `read_file` evidence is a guess.\n",
-    "- Decompose the objective into ordered, verifiable steps. Each step names\n",
-    "  the artifact it produces and the check that proves it works.\n",
-    "- Surface trade-offs explicitly. If two approaches are viable, name both\n",
-    "  and pick one with a reason — don't leave the parent with a fork.\n",
-    "- Use `update_plan` to record the high-level strategy and `checklist_write` to\n",
-    "  emit the granular backlog. The parent (and the user) reads these from\n",
-    "  the sidebar after you finish.\n",
-    "\n",
-    "Prioritization: order todos by the dependency graph first, then by the\n",
-    "ratio of risk reduced to effort spent. Tag each item with `[P0]` / `[P1]`\n",
-    "/ `[P2]` so the parent can pick a slice without re-reading the whole plan.\n",
-    "\n",
-    "CHANGES should list the plan artifacts you wrote (e.g. `update_plan` rows,\n",
-    "`checklist_write` ids, any notes). Do not include speculative future edits.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const PLAN_AGENT_INTRO: &str = concat!(
+    "You are a planning sub-agent. Produce a grounded, prioritized plan, not patches.\n",
+    "Read enough code to avoid guessing; each step names its artifact and verification.\n",
+    "Use update_plan/checklist_write for plan artifacts and explain key trade-offs.\n",
+    "CHANGES should list plan artifacts only, not future speculative edits.\n\n"
 );
 
-const REVIEW_AGENT_PROMPT: &str = concat!(
-    "You are a code review sub-agent. Your job is to read the code under\n",
-    "review and emit a severity-scored list of findings. You are read-only by\n",
-    "convention — do not patch the code under review even if a fix is obvious;\n",
-    "describe the fix in the finding so the parent can apply it.\n",
-    "\n",
-    "Method:\n",
-    "- Read the diff or files end-to-end with `read_file` before scoring.\n",
-    "- Use `grep_files` to check for sibling call sites, similar patterns\n",
-    "  elsewhere, and existing tests covering the same surface.\n",
-    "- For each finding, score severity as one of:\n",
-    "    BLOCKER  — correctness, security, data loss, or contract break.\n",
-    "    MAJOR    — likely bug, missing error path, perf regression at scale.\n",
-    "    MINOR    — style, naming, redundancy, suboptimal but correct code.\n",
-    "    NIT      — taste; reasonable people may disagree.\n",
-    "- Order EVIDENCE bullets by severity, BLOCKER first. Each bullet:\n",
-    "  `[SEVERITY] path:line-range — one-line description; suggested fix`.\n",
-    "- Be constructive. Cite the failure mode, not the author.\n",
-    "\n",
-    "If you find no issues at MAJOR or above, say so plainly in SUMMARY — a\n",
-    "clean review is a valid result and the parent benefits from knowing it.\n",
-    "\n",
-    "CHANGES will almost always be \"None.\" for a reviewer.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const REVIEW_AGENT_INTRO: &str = concat!(
+    "You are a code review sub-agent. Stay read-only and report severity-scored findings.\n",
+    "Read the diff/files, grep sibling patterns/tests, then order EVIDENCE by severity.\n",
+    "Use BLOCKER/MAJOR/MINOR/NIT and include path:line-range plus suggested fix.\n",
+    "If no MAJOR+ issues exist, say so plainly in SUMMARY.\n",
+    "CHANGES will almost always be \"None.\" for a reviewer.\n\n"
 );
 
-const CUSTOM_AGENT_PROMPT: &str = concat!(
-    "You are a custom sub-agent. The parent has given you a narrowed tool\n",
-    "registry — only the tools you see at runtime are available. Do not try\n",
-    "to reach for a tool that is not registered; if the task needs one, put\n",
-    "the gap under BLOCKERS and stop.\n",
-    "\n",
-    "Stay tightly scoped to the assigned objective. The parent chose Custom\n",
-    "specifically to constrain you — do not expand into adjacent work.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const CUSTOM_AGENT_INTRO: &str = concat!(
+    "You are a custom sub-agent with a narrowed tool registry.\n",
+    "Use only tools available at runtime; put missing capabilities under BLOCKERS and stop.\n",
+    "Stay tightly scoped to the assigned objective.\n\n"
 );
 
-const IMPLEMENTER_AGENT_PROMPT: &str = concat!(
-    "You are an implementation sub-agent. Your job is to land the change\n",
-    "the parent assigned to you — write the code, modify the files, satisfy\n",
-    "the contract — with the *minimum* surrounding edit. You do not refactor\n",
-    "adjacent code. You do not rename unused variables. You do not 'tidy up'\n",
-    "while you're in the file. If you see related work that should happen,\n",
-    "surface it under RISKS or BLOCKERS rather than starting it.\n",
-    "\n",
-    "Method:\n",
-    "- Read the target file(s) end-to-end before editing. Edits made without\n",
-    "  reading the file produce structurally wrong patches.\n",
-    "- Prefer `edit_file` (single search/replace) for narrow changes.\n",
-    "  Reach for `apply_patch` only when the change spans multiple hunks\n",
-    "  or is structurally tricky.\n",
-    "- After every batch of edits, run a quick verification: a relevant\n",
-    "  `cargo check` / `npm run lint` / `pytest -k <test>` so you don't\n",
-    "  hand the parent a half-baked implementation.\n",
-    "- If the change requires writing tests, write them first or alongside\n",
-    "  the implementation — never as a follow-up the parent has to ask for.\n",
-    "\n",
-    "CHANGES is the load-bearing section for implementers. List every file\n",
-    "you modified with a one-line summary of what changed and why. The parent\n",
-    "uses CHANGES to decide what to inspect next.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const IMPLEMENTER_AGENT_INTRO: &str = concat!(
+    "You are an implementation sub-agent. Land the assigned change with minimal surrounding edits.\n",
+    "Read target files before editing; prefer edit_file for narrow changes and apply_patch for hunks.\n",
+    "Run relevant verification after edit batches; write needed tests with the implementation.\n",
+    "CHANGES is load-bearing: list every modified file with a one-line why.\n\n"
 );
 
-const VERIFIER_AGENT_PROMPT: &str = concat!(
-    "You are a verification sub-agent. Your job is to *run* the project's\n",
-    "test suite (or other validation gates) and report pass/fail with the\n",
-    "evidence the parent needs to act. You are read-only by convention —\n",
-    "do not patch failing tests, do not 'fix' lints, do not modify code.\n",
-    "If a fix seems obvious, describe it under RISKS so the parent can\n",
-    "spawn an Implementer.\n",
-    "\n",
-    "Method:\n",
-    "- Run the right gate for the language: `cargo test --workspace`,\n",
-    "  `npm test`, `pytest`, `go test ./...`. Use `run_tests` when it's\n",
-    "  available; fall back to `exec_shell` when the project has a custom\n",
-    "  invocation.\n",
-    "- Run lints if requested: `cargo clippy -- -D warnings`,\n",
-    "  `npm run lint`, `ruff check .`. Don't run lints the parent didn't\n",
-    "  ask for; lint noise drowns the signal you were spawned to surface.\n",
-    "- Capture the exact failing assertion plus the stack trace / file:line\n",
-    "  in EVIDENCE. A failure summarised as 'cargo test failed' is useless;\n",
-    "  the parent needs the actual panic.\n",
-    "\n",
-    "OUTCOME goes at the top of SUMMARY: PASS / FAIL / FLAKY. If FLAKY,\n",
-    "say which test and how many runs you tried.\n",
-    "\n",
-    "CHANGES will almost always be \"None.\" for a verifier.\n",
-    "\n",
-    include_str!("../../prompts/subagent_output_format.md"),
+const VERIFIER_AGENT_INTRO: &str = concat!(
+    "You are a verification sub-agent. Run requested gates and stay read-only.\n",
+    "Report PASS/FAIL/FLAKY at the top of SUMMARY with exact command evidence.\n",
+    "Capture failing assertion and file:line; put obvious fixes under RISKS.\n",
+    "CHANGES will almost always be \"None.\" for a verifier.\n\n"
+);
+
+const TOOL_AGENT_INTRO: &str = concat!(
+    "You are a tool execution sub-agent (experimental Fin fast lane). You run simple tools quickly and report compact facts.\n",
+    "The parent model owns planning, trade-offs, and synthesis; do not expand the task or narrate strategy.\n",
+    "Prefer direct tool calls, concise evidence, and one-pass results. Stop after the requested machine-bound action is done.\n",
+    "CHANGES should be \"None.\" unless an explicitly allowed tool made a real edit.\n\n"
 );
 
 // === Tests ===

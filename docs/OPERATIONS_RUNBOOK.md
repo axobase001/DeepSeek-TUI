@@ -1,4 +1,4 @@
-# DeepSeek TUI Operations Runbook
+# codewhale Operations Runbook
 
 This runbook covers practical debugging and incident response for the local CLI/TUI runtime.
 
@@ -24,7 +24,7 @@ Symptoms:
 Checks:
 1. Inspect retry/health logs (`deepseek_cli::client`)
 2. Verify endpoint connectivity:
-   - `curl -sS https://api.deepseek.com/v1/models -H "Authorization: Bearer $DEEPSEEK_API_KEY"`
+   - `curl -sS https://api.deepseek.com/beta/models -H "Authorization: Bearer $DEEPSEEK_API_KEY"`
 3. Confirm no local sandbox/permission deadlock in tool output
 
 Actions:
@@ -56,7 +56,7 @@ Expected behavior:
 - Startup begins a fresh session unless `--resume`/`--continue` is supplied
 
 Actions:
-1. Resume prior work explicitly via `deepseek --resume <id>` or `Ctrl+R` in TUI
+1. Resume prior work explicitly via `codewhale --resume <id>` or `Ctrl+R` in TUI
 2. If checkpoint inspection is needed, inspect `latest.json` for schema mismatch/details
 3. If schema is newer than binary supports, upgrade binary or remove stale checkpoint
 

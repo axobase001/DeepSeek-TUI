@@ -10,8 +10,9 @@ visual motion and density for screen-reader and low-motion users.
 | Toggle | Default | Effect |
 | --- | --- | --- |
 | `NO_ANIMATIONS=1` env var | unset | At startup, forces `low_motion = true` and `fancy_animations = false`. Overrides whatever's saved in `settings.toml`. |
-| `low_motion` setting | `false` | Suppresses spinners' motion, transcript fade-ins, footer drift, and the active-cell pulse. The frame-rate limiter also slows down idle redraws so the cursor doesn't blink as aggressively. |
-| `fancy_animations` setting | `false` | Footer water-spout strip and pulsing sub-agent counter. Off by default. |
+| `low_motion` setting | `false` | Uses calmer streaming pacing and a lower redraw cadence so cursor/status motion is less aggressive. The footer water strip is controlled separately by `fancy_animations`. |
+| `fancy_animations` setting | `true` | Footer water-spout strip and pulsing sub-agent counter. Set to `false` to keep live-turn chrome still. |
+| `status_indicator` setting | `whale` | Header status chip. Set to `dots` for the compact dot cycle or `off` to hide it. |
 | `calm_mode` setting | `false` | Collapses tool-output details by default and trims status messages. Useful for screen readers that announce every redraw. |
 | `show_thinking` setting | `true` | Set to `false` to hide model `reasoning_content` blocks entirely. |
 | `show_tool_details` setting | `true` | Set to `false` to render tool calls as one-liners without expanded payloads. |
@@ -43,10 +44,16 @@ The same toggles are reachable from the command palette:
 * `/settings set low_motion on`
 * `/settings set fancy_animations off`
 * `/settings set calm_mode on`
+* `/settings set status_indicator off`
 
 Settings written this way persist to `~/.config/deepseek/settings.toml`.
 The `NO_ANIMATIONS` env var still wins at startup if it's set, so
 unsetting the env var is the way to honor your saved choice.
+
+Tilix and Terminator sessions automatically start in low-motion mode because
+those VTE-based terminals have reported visible redraw flicker during active
+turns. You can still override the saved settings after launch if your terminal
+version renders cleanly.
 
 ## Notes for screen-reader users
 
@@ -61,14 +68,14 @@ unsetting the env var is the way to honor your saved choice.
   Terminal) will pass the rendered content straight through.
 * If you find a UI surface that still produces motion when
   `low_motion = true`, please file an issue against
-  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/DeepSeek-TUI/issues/450)
+  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/CodeWhale/issues/450)
   with a screenshot or terminal recording.
 
 ## Related issues / history
 
-* [#450](https://github.com/Hmbown/DeepSeek-TUI/issues/450) —
+* [#450](https://github.com/Hmbown/CodeWhale/issues/450) —
   documenting the existing flag, adding the `NO_ANIMATIONS`
   startup overlay, and writing this page.
-* [#449](https://github.com/Hmbown/DeepSeek-TUI/issues/449) —
+* [#449](https://github.com/Hmbown/CodeWhale/issues/449) —
   footer statusline now uses the active theme's contrast pair
   instead of a bespoke palette.

@@ -1,17 +1,23 @@
 //! File search tool with fuzzy matching and scoring.
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::tools::search::matches_glob;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, optional_u64, required_str,
 };
+
+const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 struct FileSearchMatch {
@@ -29,7 +35,7 @@ impl ToolSpec for FileSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search for files using fuzzy matching with score-based ranking."
+        "Find files by name using fuzzy matching with score-based ranking. Use this instead of `find -name` or `fd` in `exec_shell` for filename search. Pass `extensions` to filter by suffix."
     }
 
     fn input_schema(&self) -> Value {
@@ -52,6 +58,11 @@ impl ToolSpec for FileSearchTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional list of file extensions to include (e.g. [\"rs\", \"md\"])."
+                },
+                "exclude": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional glob patterns to exclude, matching grep_files' convention (e.g. [\"target/**\", \"*.lock\"])."
                 }
             },
             "required": ["query"]
@@ -79,8 +90,86 @@ impl ToolSpec for FileSearchTool {
         };
 
         let extensions = parse_extensions(&input);
-        let matches = search_files(query, &base_path, extensions, limit)?;
+        let exclude_patterns = parse_exclude_patterns(&input);
+        let matches = search_files_async(
+            query.to_string(),
+            base_path,
+            extensions,
+            exclude_patterns,
+            limit,
+            context.cancel_token.clone(),
+            FILE_SEARCH_TIMEOUT,
+        )
+        .await?;
         ToolResult::json(&matches).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
+}
+
+async fn search_files_async(
+    query: String,
+    base_path: PathBuf,
+    extensions: Vec<String>,
+    exclude_patterns: Vec<String>,
+    limit: usize,
+    cancel_token: Option<CancellationToken>,
+    timeout: Duration,
+) -> Result<Vec<FileSearchMatch>, ToolError> {
+    let worker_cancel_token = cancel_token.clone();
+    run_blocking_file_search(timeout, cancel_token, move || {
+        search_files(
+            &query,
+            &base_path,
+            extensions,
+            exclude_patterns,
+            limit,
+            worker_cancel_token.as_ref(),
+        )
+    })
+    .await
+}
+
+async fn run_blocking_file_search<F>(
+    timeout: Duration,
+    cancel_token: Option<CancellationToken>,
+    search: F,
+) -> Result<Vec<FileSearchMatch>, ToolError>
+where
+    F: FnOnce() -> Result<Vec<FileSearchMatch>, ToolError> + Send + 'static,
+{
+    if cancel_token
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(file_search_cancelled());
+    }
+
+    let task = tokio::task::spawn_blocking(search);
+    let result = match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return Err(file_search_cancelled()),
+                result = tokio::time::timeout(timeout, task) => result,
+            }
+        }
+        None => tokio::time::timeout(timeout, task).await,
+    };
+
+    let joined = result.map_err(|_| file_search_timeout(timeout))?;
+    joined.map_err(|err| {
+        ToolError::execution_failed(format!(
+            "file_search worker failed before completion: {err}"
+        ))
+    })?
+}
+
+fn file_search_cancelled() -> ToolError {
+    ToolError::execution_failed("file_search cancelled before completion")
+}
+
+fn file_search_timeout(timeout: Duration) -> ToolError {
+    ToolError::Timeout {
+        seconds: timeout.as_secs().max(1),
     }
 }
 
@@ -107,12 +196,42 @@ fn parse_extensions(input: &Value) -> Vec<String> {
     out
 }
 
+fn parse_exclude_patterns(input: &Value) -> Vec<String> {
+    if let Some(values) = input.get("exclude").and_then(Value::as_array) {
+        return values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+
+    [
+        "target/**",
+        "node_modules/**",
+        ".git/**",
+        "DerivedData/**",
+        "dist/**",
+        "build/**",
+        "*.lock",
+        "*.plist",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn search_files(
     query: &str,
     base_path: &Path,
     extensions: Vec<String>,
+    exclude_patterns: Vec<String>,
     limit: usize,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<Vec<FileSearchMatch>, ToolError> {
+    check_cancelled(cancel_token)?;
+
     if !base_path.exists() {
         return Err(ToolError::invalid_input(format!(
             "Base path does not exist: {}",
@@ -124,10 +243,12 @@ fn search_files(
     let mut results: Vec<FileSearchMatch> = Vec::new();
 
     let mut builder = WalkBuilder::new(base_path);
-    builder.hidden(false).follow_links(true).require_git(false);
+    builder.hidden(false).follow_links(false).require_git(false);
     let walker = builder.build();
 
     for entry in walker {
+        check_cancelled(cancel_token)?;
+
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -137,15 +258,19 @@ fn search_files(
         }
 
         let path = entry.path();
-        if !extensions.is_empty() && !extension_matches(path, &extensions) {
-            continue;
-        }
-
         let rel_path = path
             .strip_prefix(base_path)
             .unwrap_or(path)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
+        if should_exclude(&rel_path, &exclude_patterns) {
+            continue;
+        }
+
+        if !extensions.is_empty() && !extension_matches(path, &extensions) {
+            continue;
+        }
+
         let name = file_name(path);
 
         let score = match score_match(&query_norm, &rel_path, &name) {
@@ -165,6 +290,19 @@ fn search_files(
         results.truncate(limit);
     }
     Ok(results)
+}
+
+fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<(), ToolError> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(file_search_cancelled());
+    }
+    Ok(())
+}
+
+fn should_exclude(rel_path: &str, exclude_patterns: &[String]) -> bool {
+    exclude_patterns
+        .iter()
+        .any(|pattern| matches_glob(rel_path, pattern))
 }
 
 fn extension_matches(path: &Path, extensions: &[String]) -> bool {
@@ -321,5 +459,104 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("main.rs"));
         assert!(!result.content.contains("notes.md"));
+    }
+
+    #[tokio::test]
+    async fn test_file_search_exclude_filter() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("fixtures")).expect("mkdir");
+        std::fs::write(root.join("fixtures").join("needle.txt"), "no\n").expect("write");
+        std::fs::write(root.join("needle.txt"), "yes\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let tool = FileSearchTool;
+        let result = tool
+            .execute(json!({"query": "needle", "exclude": ["fixtures/**"]}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("\"path\": \"needle.txt\""));
+        assert!(!result.content.contains("fixtures/needle.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_file_search_default_excludes_build_artifacts() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("target")).expect("mkdir");
+        std::fs::write(root.join("target").join("needle.txt"), "no\n").expect("write");
+        std::fs::write(root.join("needle.txt"), "yes\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let tool = FileSearchTool;
+        let result = tool
+            .execute(json!({"query": "needle"}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("\"path\": \"needle.txt\""));
+        assert!(!result.content.contains("target/needle.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_file_search_respects_cancel_token() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("needle.txt"), "yes\n").expect("write");
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let ctx = ToolContext::new(root.to_path_buf()).with_cancel_token(cancel_token);
+
+        let tool = FileSearchTool;
+        let err = tool
+            .execute(json!({"query": "needle"}), &ctx)
+            .await
+            .expect_err("cancelled file_search should return an error");
+
+        assert!(
+            format!("{err:?}").contains("cancelled"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_search_blocking_wrapper_reports_timeout() {
+        let err = run_blocking_file_search(Duration::from_millis(1), None, || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(Vec::new())
+        })
+        .await
+        .expect_err("slow file_search worker should time out");
+
+        assert!(
+            matches!(err, ToolError::Timeout { seconds: 1 }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_file_search_does_not_follow_symlinked_files() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "outside\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside_file, root.join("secret.txt")).expect("symlink");
+
+        let ctx = ToolContext::new(root);
+        let tool = FileSearchTool;
+        let result = tool
+            .execute(json!({"query": "secret"}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(!result.content.contains("secret.txt"));
     }
 }

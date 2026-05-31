@@ -51,7 +51,7 @@ pub fn summarize_project(root: &Path) -> String {
     let mut key_files = Vec::new();
 
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(false).follow_links(true).max_depth(Some(2));
+    builder.hidden(false).follow_links(false).max_depth(Some(2));
     let walker = builder.build();
 
     for entry in walker {
@@ -59,6 +59,9 @@ pub fn summarize_project(root: &Path) -> String {
             Ok(entry) => entry,
             Err(_) => continue,
         };
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            continue;
+        }
         if is_key_file(entry.path())
             && let Ok(rel) = entry.path().strip_prefix(root)
         {
@@ -113,10 +116,13 @@ pub fn project_tree(root: &Path, max_depth: usize) -> String {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(true)
+        .follow_links(false)
         .max_depth(Some(max_depth + 1));
 
     for entry in builder.build().flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            continue;
+        }
         let depth = entry.depth();
         if depth == 0 || depth > max_depth {
             continue;
@@ -253,7 +259,17 @@ fn write_panic_dump(
     let home = dirs::home_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
     })?;
-    let crash_dir = home.join(".deepseek").join("crashes");
+    // Prefer .codewhale, fall back to .deepseek
+    let crash_dir = home.join(".codewhale").join("crashes");
+    if !crash_dir.exists() {
+        // Try legacy path for reading, but prefer new for writing
+        let _ = std::fs::create_dir_all(&crash_dir);
+    }
+    let crash_dir = if crash_dir.exists() {
+        crash_dir
+    } else {
+        home.join(".deepseek").join("crashes")
+    };
     write_panic_dump_to(&crash_dir, name, location, message)
 }
 
@@ -272,6 +288,40 @@ fn write_panic_dump_to(
         format!("Task: {name}\nLocation: {location}\nTimestamp: {timestamp}\nPanic: {message}\n");
     std::fs::write(&path, contents)?;
     Ok(())
+}
+
+/// Fire-and-forget `spawn_blocking` with panic dump protection.
+///
+/// In contrast to `spawn_supervised` (which wraps `tokio::spawn` for async
+/// tasks), this helper wraps `tokio::task::spawn_blocking`.  Use it when a
+/// CPU-bound or blocking-I/O task must run off the async runtime and its
+/// completion is *not* awaited — for example a post-turn disk snapshot or a
+/// file-tree build polled later via a shared data structure.  If the closure
+/// panics, a crash dump is written to `~/.deepseek/crashes/` and the panic
+/// is logged at ERROR level rather than being silently swallowed.
+#[track_caller]
+pub fn spawn_blocking_supervised<F>(name: &'static str, f: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let location = std::panic::Location::caller();
+    tokio::task::spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if let Err(panic_info) = result {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::error!(
+                target: "panic",
+                "Blocking task '{name}' panicked at {location}: {msg}",
+            );
+            let _ = write_panic_dump(name, location, &msg);
+        }
+    })
 }
 
 #[allow(dead_code)]
@@ -366,24 +416,6 @@ pub fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
         return out;
     }
     path.display().to_string()
-}
-
-/// Check whether the system locale is Chinese (zh-*).
-///
-/// Reads `LC_ALL`, `LC_MESSAGES`, and `LANG` environment variables.
-/// Used by the first-run flow to suggest `DeepseekCN` as the default
-/// provider for users in China.
-#[must_use]
-pub fn is_chinese_system_locale() -> bool {
-    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(value) = std::env::var(key) {
-            let normalized = value.split('.').next().unwrap_or(&value).replace('_', "-");
-            if normalized.to_ascii_lowercase().starts_with("zh") {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Estimate the total character count across message content blocks.
@@ -579,6 +611,27 @@ mod spawn_supervised_tests {
         );
     }
 
+    #[tokio::test]
+    async fn panicking_blocking_task_does_not_propagate_to_parent() {
+        let parent_alive = Arc::new(AtomicBool::new(false));
+        let parent_alive_clone = parent_alive.clone();
+
+        let handle = spawn_blocking_supervised("blocking-panic-test-fixture", move || {
+            parent_alive_clone.store(true, Ordering::SeqCst);
+            panic!("deliberate panic for spawn_blocking catch-unwind test");
+        });
+
+        let result = handle.await;
+        assert!(
+            result.is_ok(),
+            "spawn_blocking_supervised must convert panic to a normal completion"
+        );
+        assert!(
+            parent_alive.load(Ordering::SeqCst),
+            "fixture blocking task must have run before panicking"
+        );
+    }
+
     /// `write_panic_dump_to` writes a properly-formatted crash log into
     /// the supplied directory. Tested separately from `spawn_supervised`
     /// because env-mutation redirection of `dirs::home_dir()` doesn't
@@ -677,6 +730,22 @@ mod project_mapping_tests {
         fs::write(root.join("a.txt"), "a").expect("write");
 
         assert_eq!(project_tree(root, 1), project_tree(root, 1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_mapping_does_not_follow_symlinked_key_files() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&root).expect("mkdir workspace");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        let outside_file = outside.join("Cargo.toml");
+        fs::write(&outside_file, "[package]\nname = \"outside\"\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside_file, root.join("Cargo.toml")).expect("symlink");
+
+        assert_eq!(summarize_project(&root), "Unknown project type");
+        assert!(!project_tree(&root, 1).contains("Cargo.toml"));
     }
 
     #[test]

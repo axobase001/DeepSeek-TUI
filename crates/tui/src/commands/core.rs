@@ -1,11 +1,12 @@
 //! Core commands: help, clear, exit, model
 
 use std::fmt::Write;
+use std::path::PathBuf;
 
-use crate::config::{COMMON_DEEPSEEK_MODELS, normalize_model_name};
+use crate::config::{COMMON_DEEPSEEK_MODELS, normalize_model_name_for_provider};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
-use crate::tui::views::{HelpView, ModalKind, SubAgentsView};
+use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
 use super::CommandResult;
 
@@ -45,24 +46,7 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
-    app.clear_history();
-    app.mark_history_updated();
-    app.api_messages.clear();
-    app.system_prompt = None;
-    app.viewport.transcript_selection.clear();
-    app.queued_messages.clear();
-    app.queued_draft = None;
-    app.session.total_conversation_tokens = 0;
-    let todos_cleared = app.clear_todos();
-    app.tool_log.clear();
-    app.tool_cells.clear();
-    app.tool_details_by_cell.clear();
-    app.exploring_entries.clear();
-    app.ignored_tool_calls.clear();
-    app.pending_tool_uses.clear();
-    app.last_exec_wait_command = None;
-    app.session.last_prompt_tokens = None;
-    app.session.last_completion_tokens = None;
+    let todos_cleared = reset_conversation_state(app);
     app.current_session_id = None;
     let locale = app.ui_locale;
     let message = if todos_cleared {
@@ -73,12 +57,50 @@ pub fn clear(app: &mut App) -> CommandResult {
     CommandResult::with_message_and_action(
         message,
         AppAction::SyncSession {
+            session_id: None,
             messages: Vec::new(),
             system_prompt: None,
             model: app.model.clone(),
             workspace: app.workspace.clone(),
         },
     )
+}
+
+/// Reset the active conversation without choosing the next session id.
+pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
+    app.clear_history();
+    app.mark_history_updated();
+    app.api_messages.clear();
+    app.system_prompt = None;
+    app.viewport.transcript_selection.clear();
+    app.queued_messages.clear();
+    app.queued_draft = None;
+    app.session.total_tokens = 0;
+    app.session.total_conversation_tokens = 0;
+    app.session.reset_token_breakdown();
+    app.session.session_cost = 0.0;
+    app.session.session_cost_cny = 0.0;
+    app.session.subagent_cost = 0.0;
+    app.session.subagent_cost_cny = 0.0;
+    app.session.subagent_cost_event_seqs.clear();
+    app.session.displayed_cost_high_water = 0.0;
+    app.session.displayed_cost_high_water_cny = 0.0;
+    let todos_cleared = app.clear_todos();
+    app.tool_log.clear();
+    app.tool_cells.clear();
+    app.tool_details_by_cell.clear();
+    app.exploring_entries.clear();
+    app.ignored_tool_calls.clear();
+    app.pending_tool_uses.clear();
+    app.last_exec_wait_command = None;
+    app.session.last_prompt_tokens = None;
+    app.session.last_completion_tokens = None;
+    app.session.last_prompt_cache_hit_tokens = None;
+    app.session.last_prompt_cache_miss_tokens = None;
+    app.session.last_reasoning_replay_tokens = None;
+    app.session.turn_cache_history.clear();
+    app.session.last_cache_inspection = None;
+    todos_cleared
 }
 
 /// Exit the application
@@ -93,14 +115,19 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
     if let Some(name) = model_name {
         if name.trim().eq_ignore_ascii_case("auto") {
             let old_model = app.model_display_label();
+            let model_changed = !app.auto_model || app.model != "auto";
             app.auto_model = true;
             app.model = "auto".to_string();
             app.last_effective_model = None;
             app.reasoning_effort = ReasoningEffort::Auto;
             app.last_effective_reasoning_effort = None;
             app.update_model_compaction_budget();
-            app.session.last_prompt_tokens = None;
-            app.session.last_completion_tokens = None;
+            if model_changed {
+                app.clear_model_scoped_telemetry();
+            } else {
+                app.session.last_prompt_tokens = None;
+                app.session.last_completion_tokens = None;
+            }
             return CommandResult::with_message_and_action(
                 tr(app.ui_locale, MessageId::ModelChanged)
                     .replace("{old}", &old_model)
@@ -108,19 +135,24 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let Some(model_id) = normalize_model_name(name) else {
+        let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
             return CommandResult::error(format!(
                 "Invalid model '{name}'. Expected auto or a DeepSeek model ID. Common models: {}",
                 COMMON_DEEPSEEK_MODELS.join(", ")
             ));
         };
         let old_model = app.model_display_label();
+        let model_changed = app.auto_model || app.model != model_id;
         app.auto_model = false;
         app.model = model_id.clone();
         app.last_effective_model = None;
         app.update_model_compaction_budget();
-        app.session.last_prompt_tokens = None;
-        app.session.last_completion_tokens = None;
+        if model_changed {
+            app.clear_model_scoped_telemetry();
+        } else {
+            app.session.last_prompt_tokens = None;
+            app.session.last_completion_tokens = None;
+        }
         CommandResult::with_message_and_action(
             tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
@@ -140,8 +172,8 @@ pub fn models(_app: &mut App) -> CommandResult {
 /// List sub-agent status from the engine
 pub fn subagents(app: &mut App) -> CommandResult {
     if app.view_stack.top_kind() != Some(ModalKind::SubAgents) {
-        app.view_stack
-            .push(SubAgentsView::new(app.subagent_cache.clone()));
+        let agents = subagent_view_agents(app, &app.subagent_cache);
+        app.view_stack.push(SubAgentsView::new(agents));
     }
     app.status_message = Some(tr(app.ui_locale, MessageId::SubagentsFetching).to_string());
     CommandResult::action(AppAction::ListSubAgents)
@@ -163,6 +195,50 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
             profile: profile_name,
         },
     )
+}
+
+pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
+        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
+    };
+
+    let expanded = match expand_workspace_path(raw_path) {
+        Ok(path) => path,
+        Err(message) => return CommandResult::error(message),
+    };
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        app.workspace.join(expanded)
+    };
+
+    if !candidate.exists() {
+        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
+    }
+    if !candidate.is_dir() {
+        return CommandResult::error(format!(
+            "Workspace is not a directory: {}",
+            candidate.display()
+        ));
+    }
+
+    let workspace = candidate.canonicalize().unwrap_or(candidate);
+    CommandResult::with_message_and_action(
+        format!("Switching workspace to {}...", workspace.display()),
+        AppAction::SwitchWorkspace { workspace },
+    )
+}
+
+fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
+    if path == "~" {
+        return dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home =
+            dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
+        return Ok(home.join(rest));
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Show `DeepSeek` dashboard and docs links
@@ -290,14 +366,32 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
     CommandResult::message(stats)
 }
 
+/// Toggle output translation to the current system language on/off.
+///
+/// When enabled, the model is instructed to respond in the current locale and an
+/// interception layer translates any remaining English output before it
+/// reaches the user.
+pub fn translate(app: &mut App) -> CommandResult {
+    app.translation_enabled = !app.translation_enabled;
+    let locale = app.ui_locale;
+    if app.translation_enabled {
+        CommandResult::message(tr(locale, MessageId::CmdTranslateOn))
+    } else {
+        CommandResult::message(tr(locale, MessageId::CmdTranslateOff))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::PromptInspection;
     use crate::config::Config;
     use crate::models::Message;
-    use crate::tui::app::{App, AppMode, TuiOptions};
+    use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
     use std::path::PathBuf;
+    use std::time::Instant;
+    use tempfile::tempdir;
 
     fn create_test_app() -> App {
         let options = TuiOptions {
@@ -321,7 +415,10 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        app.ui_locale = crate::localization::Locale::En;
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app
     }
 
     #[test]
@@ -408,6 +505,18 @@ mod tests {
         app.session.total_conversation_tokens = 100;
         app.tool_log.push("test".to_string());
         app.current_session_id = Some("existing-session".to_string());
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "existing-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 128,
+                preview: "tool output".to_string(),
+                storage_path: PathBuf::from("/tmp/tool_outputs/call-big.txt"),
+            });
 
         let result = clear(&mut app);
         assert!(result.message.is_some());
@@ -417,8 +526,56 @@ mod tests {
         assert!(app.tool_log.is_empty());
         assert!(app.tool_cells.is_empty());
         assert!(app.tool_details_by_cell.is_empty());
+        assert!(app.session_artifacts.is_empty());
         assert!(app.current_session_id.is_none());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn clear_resets_session_telemetry() {
+        let mut app = create_test_app();
+        app.session.total_tokens = 234;
+        app.session.total_conversation_tokens = 123;
+        app.session.session_cost = 0.42;
+        app.session.session_cost_cny = 3.05;
+        app.session.subagent_cost = 0.11;
+        app.session.subagent_cost_cny = 0.80;
+        app.session.subagent_cost_event_seqs.insert(7);
+        app.session.displayed_cost_high_water = 0.53;
+        app.session.displayed_cost_high_water_cny = 3.85;
+        app.session.last_prompt_cache_hit_tokens = Some(70);
+        app.session.last_prompt_cache_miss_tokens = Some(30);
+        app.session.last_reasoning_replay_tokens = Some(12);
+        app.session.last_cache_inspection = Some(PromptInspection {
+            base_static_prefix_hash: "base".to_string(),
+            full_request_prefix_hash: "full".to_string(),
+            layers: Vec::new(),
+        });
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        clear(&mut app);
+
+        assert_eq!(app.session.total_tokens, 0);
+        assert_eq!(app.session.total_conversation_tokens, 0);
+        assert_eq!(app.session.session_cost, 0.0);
+        assert_eq!(app.session.session_cost_cny, 0.0);
+        assert_eq!(app.session.subagent_cost, 0.0);
+        assert_eq!(app.session.subagent_cost_cny, 0.0);
+        assert!(app.session.subagent_cost_event_seqs.is_empty());
+        assert_eq!(app.session.displayed_cost_high_water, 0.0);
+        assert_eq!(app.session.displayed_cost_high_water_cny, 0.0);
+        assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
+        assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
+        assert_eq!(app.session.last_reasoning_replay_tokens, None);
+        assert!(app.session.turn_cache_history.is_empty());
+        assert_eq!(app.session.last_cache_inspection, None);
     }
 
     #[test]
@@ -426,6 +583,62 @@ mod tests {
         let result = exit();
         assert!(result.message.is_none());
         assert!(matches!(result.action, Some(AppAction::Quit)));
+    }
+
+    #[test]
+    fn workspace_without_arg_shows_current_workspace() {
+        let mut app = create_test_app();
+        let result = workspace_switch(&mut app, None);
+        let msg = result.message.expect("workspace should be shown");
+        assert!(msg.contains("Current workspace:"));
+        assert!(msg.contains("/tmp/test-workspace"));
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn workspace_existing_absolute_dir_returns_switch_action() {
+        let mut app = create_test_app();
+        let dir = tempdir().expect("temp dir");
+        let result = workspace_switch(&mut app, Some(dir.path().to_str().unwrap()));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SwitchWorkspace { workspace }) if workspace == dir.path().canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn workspace_relative_dir_resolves_from_current_workspace() {
+        let root = tempdir().expect("temp dir");
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        let mut app = create_test_app();
+        app.workspace = root.path().to_path_buf();
+
+        let result = workspace_switch(&mut app, Some("child"));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SwitchWorkspace { workspace }) if workspace == child.canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn workspace_rejects_missing_path() {
+        let mut app = create_test_app();
+        let result = workspace_switch(&mut app, Some("definitely-missing"));
+        assert!(result.is_error);
+        assert!(result.message.unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn workspace_rejects_file_path() {
+        let root = tempdir().expect("temp dir");
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "not a directory").expect("test file");
+        let mut app = create_test_app();
+
+        let result = workspace_switch(&mut app, Some(file.to_str().unwrap()));
+        assert!(result.is_error);
+        assert!(result.message.unwrap().contains("not a directory"));
     }
 
     #[test]
@@ -444,6 +657,47 @@ mod tests {
         assert_eq!(app.model, "deepseek-v4-flash");
         assert_eq!(app.session.last_prompt_tokens, None);
         assert_eq!(app.session.last_completion_tokens, None);
+    }
+
+    #[test]
+    fn model_switch_clears_turn_cache_history() {
+        let mut app = create_test_app();
+        // Keep the assertion independent of the developer's saved default model.
+        app.auto_model = false;
+        app.model = "deepseek-v4-pro".to_string();
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        let result = model(&mut app, Some("deepseek-v4-flash"));
+
+        assert!(result.message.is_some());
+        assert!(app.session.turn_cache_history.is_empty());
+    }
+
+    #[test]
+    fn model_reset_same_model_keeps_turn_cache_history() {
+        let mut app = create_test_app();
+        app.auto_model = false;
+        app.model = "deepseek-v4-pro".to_string();
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        let result = model(&mut app, Some("deepseek-v4-pro"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.session.turn_cache_history.len(), 1);
     }
 
     #[test]
@@ -535,7 +789,7 @@ mod tests {
         let result = home_dashboard(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        assert!(msg.contains("DeepSeek TUI Home Dashboard"));
+        assert!(msg.contains("codewhale Home Dashboard"));
         assert!(msg.contains("Model:"));
         assert!(msg.contains("Mode:"));
         assert!(msg.contains("Workspace:"));
@@ -584,7 +838,7 @@ mod tests {
             !msg.lines()
                 .any(|line| line.trim_start().starts_with("/set "))
         );
-        assert!(!msg.contains("/deepseek"));
+        assert!(!msg.contains("/codewhale"));
     }
 
     #[test]

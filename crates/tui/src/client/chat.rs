@@ -4,18 +4,46 @@
 //! request building (`build_chat_messages*`), and SSE parsing (`parse_sse_chunk`)
 //! all live here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
 
 /// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
 /// After this period with no data, the stream is considered stalled and
 /// yields a recoverable error so the caller can retry.
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default timeout for the initial streaming response headers.
+///
+/// `doctor` uses a bounded non-streaming request, but normal TUI turns first
+/// wait for the SSE response to open. On some Windows/proxy paths that wait can
+/// hang before any stream chunk exists, leaving the UI stuck at "Working...".
+const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Reads `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` as a bounded override for the
+/// response-header wait. This is intentionally shorter than the per-chunk idle
+/// timeout because it only covers connection setup and upstream header return,
+/// not model thinking time after streaming has started.
+fn stream_open_timeout() -> Duration {
+    stream_open_timeout_from_env(
+        std::env::var("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STREAM_OPEN_TIMEOUT.as_secs())
+        .clamp(5, 300);
+    Duration::from_secs(secs)
+}
 
 /// Reads the `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var, falling back to
 /// the default 300s. The parsed value is clamped to [1, 3600] seconds.
@@ -28,6 +56,7 @@ fn stream_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+use crate::config::ApiProvider;
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::models::{
@@ -42,17 +71,29 @@ use super::{
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
 
+fn apply_provider_token_limit(body: &mut Value, provider: ApiProvider, max_tokens: u32) {
+    if provider != ApiProvider::XiaomiMimo {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_tokens");
+    }
+    body["max_completion_tokens"] = json!(max_tokens);
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
-        let messages = build_chat_messages_for_request(request);
+        let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
         let mut body = json!({
             "model": request.model,
             "messages": messages,
             "max_tokens": request.max_tokens,
         });
+        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -61,7 +102,12 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(tools.iter().map(tool_to_chat).collect::<Vec<_>>());
+            body["tools"] = json!(
+                tools
+                    .iter()
+                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                    .collect::<Vec<_>>()
+            );
         }
         if let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -75,9 +121,23 @@ impl DeepSeekClient {
         );
 
         let url = api_url(&self.base_url, "chat/completions");
-        let response = self
-            .send_with_retry(|| self.http_client.post(&url).json(&body))
-            .await?;
+        let open_timeout = stream_open_timeout();
+        let response = match tokio_timeout(
+            open_timeout,
+            self.send_with_retry(|| self.http_client.post(&url).json(&body)),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                anyhow::bail!(
+                    "SSE stream request did not receive response headers after {}s. \
+                     `codewhale doctor` can still pass when non-streaming requests work; \
+                     on Windows or proxy networks, try `DEEPSEEK_FORCE_HTTP1=1` and rerun `codewhale`.",
+                    open_timeout.as_secs()
+                );
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -98,7 +158,7 @@ impl DeepSeekClient {
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
-        let messages = build_chat_messages_for_request(&request);
+        let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
         let mut body = json!({
             "model": request.model,
             "messages": messages,
@@ -108,6 +168,7 @@ impl DeepSeekClient {
                 "include_usage": true
             },
         });
+        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -116,7 +177,12 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(tools.iter().map(tool_to_chat).collect::<Vec<_>>());
+            body["tools"] = json!(
+                tools
+                    .iter()
+                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                    .collect::<Vec<_>>()
+            );
         }
         if let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -141,6 +207,7 @@ impl DeepSeekClient {
             &mut body,
             &request.model,
             request.reasoning_effort.as_deref(),
+            self.api_provider,
         );
 
         let url = api_url(&self.base_url, "chat/completions");
@@ -161,6 +228,7 @@ impl DeepSeekClient {
         }
 
         let model = request.model.clone();
+        let api_provider = self.api_provider;
 
         // Capture transport-shape headers before we consume `response` into
         // `bytes_stream()`. They are surfaced in the decode-error log path so
@@ -197,7 +265,7 @@ impl DeepSeekClient {
             let mut text_started = false;
             let mut thinking_started = false;
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            let is_reasoning_model = requires_reasoning_content(&model);
+            let is_reasoning_model = is_reasoning_model_for_stream(api_provider, &model);
 
             let mut byte_stream = std::pin::pin!(byte_stream);
             let idle = stream_idle_timeout();
@@ -356,16 +424,728 @@ pub(super) fn build_chat_messages(
         messages,
         model,
         should_replay_reasoning_content(model, None),
+        false,
     )
 }
 
+#[cfg(test)]
 pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<Value> {
-    build_chat_messages_with_reasoning(
-        request.system.as_ref(),
-        &request.messages,
-        &request.model,
-        should_replay_reasoning_content(&request.model, request.reasoning_effort.as_deref()),
+    PromptBuilder::for_request(request).build()
+}
+
+pub(super) fn build_chat_messages_for_request_and_provider(
+    request: &MessageRequest,
+    provider: ApiProvider,
+) -> Vec<Value> {
+    PromptBuilder::for_request(request).build_for_provider(provider)
+}
+
+pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
+    PromptBuilder::for_request(request).inspect()
+}
+
+pub(crate) fn build_cache_warmup_request(request: &MessageRequest) -> MessageRequest {
+    PromptBuilder::for_request(request).build_cache_warmup_request()
+}
+
+struct PromptBuilder<'a> {
+    system: Option<&'a SystemPrompt>,
+    messages: &'a [Message],
+    tools: Option<&'a [Tool]>,
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+}
+
+impl<'a> PromptBuilder<'a> {
+    fn for_request(request: &'a MessageRequest) -> Self {
+        Self {
+            system: request.system.as_ref(),
+            messages: &request.messages,
+            tools: request.tools.as_deref(),
+            model: &request.model,
+            reasoning_effort: request.reasoning_effort.as_deref(),
+        }
+    }
+
+    #[cfg(test)]
+    fn build(self) -> Vec<Value> {
+        build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content(self.model, self.reasoning_effort),
+            false,
+        )
+    }
+
+    fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
+        build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content_for_provider(
+                provider,
+                self.model,
+                self.reasoning_effort,
+            ),
+            false,
+        )
+    }
+
+    fn inspect(self) -> PromptInspection {
+        let messages = build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content(self.model, self.reasoning_effort),
+            true,
+        );
+        inspect_wire_request(self.tools, &messages)
+    }
+
+    fn build_cache_warmup_request(self) -> MessageRequest {
+        let system = stable_system_prompt(self.system);
+        let mut messages = stable_history_messages(self.messages);
+        let tools = self
+            .tools
+            .filter(|tools| !tools.is_empty())
+            .map(<[Tool]>::to_vec);
+        let tool_choice = tools.as_ref().map(|_| json!("none"));
+        messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: CACHE_WARMUP_USER_TAIL.to_string(),
+                cache_control: None,
+            }],
+        });
+
+        MessageRequest {
+            model: self.model.to_string(),
+            messages,
+            max_tokens: 8,
+            system,
+            tools,
+            tool_choice,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: self.reasoning_effort.map(str::to_string),
+            stream: None,
+            temperature: Some(0.0),
+            top_p: None,
+        }
+    }
+}
+
+pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
+const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
+const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
+const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
+/// Tool results shorter than this stay inline even when repeated. The
+/// extra prompt bytes are cheaper than forcing the model through an
+/// unnecessary retrieval hop for tiny command outputs.
+const TOOL_RESULT_DEDUP_MIN_CHARS: usize = 1_024;
+/// Tool results shorter than this are also exempt from disk persistence —
+/// no SHA file is written. The wire-dedup path won't fire for them
+/// anyway (see `TOOL_RESULT_DEDUP_MIN_CHARS`), so there's no retrieval
+/// burden to satisfy. Keeps `~/.deepseek/tool_outputs/` from filling
+/// up with tiny `gh auth status` and `cat package.json` files.
+const TOOL_RESULT_SHA_PERSIST_MIN_CHARS: usize = 1_024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptInspection {
+    pub base_static_prefix_hash: String,
+    pub full_request_prefix_hash: String,
+    pub layers: Vec<PromptLayerInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptLayerInspection {
+    pub name: String,
+    pub stability: PromptLayerStability,
+    pub char_len: usize,
+    pub sha256: String,
+    pub tool_result: Option<ToolResultInspection>,
+    pub turn_meta: Option<TurnMetaInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolResultInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub truncated: bool,
+    pub deduplicated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnMetaInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub deduplicated: bool,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptLayerStability {
+    Static,
+    History,
+    Dynamic,
+}
+
+impl PromptLayerStability {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::History => "history",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptInspection {
+    let mut layers = Vec::new();
+    let mut base_static_prefix_parts = Vec::new();
+    let mut full_request_prefix_parts = Vec::new();
+    let mut start_index = 0;
+
+    if let Some(message) = messages.first() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let content = message_content_for_inspect(message);
+        if role == "system" {
+            for (name, stability, body) in split_system_layers(&content) {
+                if stability == PromptLayerStability::Static {
+                    base_static_prefix_parts.push(body.to_string());
+                }
+                if stability != PromptLayerStability::Dynamic {
+                    full_request_prefix_parts.push(body.to_string());
+                }
+                layers.push(prompt_layer(name, stability, body));
+            }
+            start_index = 1;
+        }
+    }
+
+    if let Some(tool_catalog) = tool_catalog_for_inspect(tools) {
+        base_static_prefix_parts.push(tool_catalog.clone());
+        full_request_prefix_parts.push(tool_catalog.clone());
+        layers.push(prompt_layer(
+            "Tool catalog".to_string(),
+            PromptLayerStability::Static,
+            &tool_catalog,
+        ));
+    }
+
+    for (index, message) in messages.iter().enumerate().skip(start_index) {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let content = message_content_for_inspect(message);
+        let is_last = index + 1 == messages.len();
+        let stability = if (is_last && role == "user") || role == "tool" {
+            PromptLayerStability::Dynamic
+        } else {
+            PromptLayerStability::History
+        };
+        let name = if is_last && role == "user" {
+            "User task".to_string()
+        } else {
+            format!("Message #{index} {role}")
+        };
+        if stability != PromptLayerStability::Dynamic {
+            full_request_prefix_parts.push(content.clone());
+        }
+        let mut layer = prompt_layer(name, stability, &content);
+        layer.tool_result = tool_result_inspection_for_message(message);
+        layer.turn_meta = turn_meta_inspection_for_message(message);
+        layers.push(layer);
+    }
+
+    let base_static_prefix = base_static_prefix_parts.join("\n");
+    let full_request_prefix = full_request_prefix_parts.join("\n");
+
+    PromptInspection {
+        base_static_prefix_hash: sha256_hex(base_static_prefix.as_bytes()),
+        full_request_prefix_hash: sha256_hex(full_request_prefix.as_bytes()),
+        layers,
+    }
+}
+
+fn tool_catalog_for_inspect(tools: Option<&[Tool]>) -> Option<String> {
+    let tools = tools.filter(|tools| !tools.is_empty())?;
+    serde_json::to_string(&tools.iter().map(tool_to_chat).collect::<Vec<_>>()).ok()
+}
+
+fn message_content_for_inspect(message: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str)
+        && !content.is_empty()
+    {
+        parts.push(content.to_string());
+    }
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+        && !reasoning.is_empty()
+    {
+        parts.push(reasoning.to_string());
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        parts.push(tool_calls.to_string());
+    }
+    parts.join("\n")
+}
+
+fn tool_result_inspection_for_message(message: &Value) -> Option<ToolResultInspection> {
+    if message.get("role").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+    let budget = message.get("_tool_result_budget")?;
+    Some(ToolResultInspection {
+        original_chars: budget
+            .get("original_chars")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())?,
+        sent_chars: budget
+            .get("sent_chars")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())?,
+        truncated: budget
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        deduplicated: budget
+            .get("deduplicated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn turn_meta_inspection_for_message(message: &Value) -> Option<TurnMetaInspection> {
+    let budget = message.get("_turn_meta_budget")?;
+    Some(TurnMetaInspection {
+        original_chars: budget
+            .get("original_chars")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())?,
+        sent_chars: budget
+            .get("sent_chars")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())?,
+        deduplicated: budget
+            .get("deduplicated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        sha256: budget
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string)?,
+    })
+}
+
+fn split_system_layers(content: &str) -> Vec<(String, PromptLayerStability, &str)> {
+    let markers = [
+        ("Project context", "<project_instructions"),
+        ("Project context pack", "## Project Context Pack"),
+        ("Environment", "## Environment"),
+        ("Configured instructions", "<instructions "),
+        ("User memory", "## User Memory"),
+        ("Current session goal", "## Current Session Goal"),
+        ("Skills", "## Skills"),
+        ("Context management", "## Context Management"),
+        ("Compact template", "## Compact"),
+        ("Previous session relay", "## Previous Session Relay"),
+    ];
+
+    let mut starts: Vec<(usize, &str)> = markers
+        .iter()
+        .filter_map(|(name, marker)| content.find(marker).map(|idx| (idx, *name)))
+        .collect();
+    starts.sort_by_key(|(idx, _)| *idx);
+
+    let mut layers = Vec::new();
+    let first_marker = starts.first().map_or(content.len(), |(idx, _)| *idx);
+    if first_marker > 0 {
+        layers.push((
+            "Global system prefix".to_string(),
+            PromptLayerStability::Static,
+            content[..first_marker].trim(),
+        ));
+    }
+
+    for (i, (start, name)) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(content.len(), |(idx, _)| *idx);
+        let stability = if *name == "Previous session relay" {
+            PromptLayerStability::Dynamic
+        } else if is_static_base_layer(name) {
+            PromptLayerStability::Static
+        } else {
+            PromptLayerStability::History
+        };
+        layers.push(((*name).to_string(), stability, content[*start..end].trim()));
+    }
+
+    if layers.is_empty() {
+        layers.push((
+            "Global system prefix".to_string(),
+            PromptLayerStability::Static,
+            content.trim(),
+        ));
+    }
+    layers
+}
+
+fn is_static_base_layer(name: &str) -> bool {
+    matches!(
+        name,
+        "Global system prefix"
+            | "Environment"
+            | "Skills"
+            | "Project context"
+            | "Project context pack"
+            | "Context management"
+            | "Compact template"
     )
+}
+
+fn stable_system_prompt(system: Option<&SystemPrompt>) -> Option<SystemPrompt> {
+    let instructions = system_to_instructions(system.cloned())?;
+    let stable = split_system_layers(&instructions)
+        .into_iter()
+        .filter_map(|(_, stability, body)| {
+            (stability == PromptLayerStability::Static).then_some(body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if stable.trim().is_empty() {
+        None
+    } else {
+        Some(SystemPrompt::Text(stable))
+    }
+}
+
+fn stable_history_messages(messages: &[Message]) -> Vec<Message> {
+    let mut end = messages.len();
+    if messages
+        .last()
+        .is_some_and(|message| message.role.as_str() == "user")
+    {
+        end = end.saturating_sub(1);
+    }
+    messages[..end].to_vec()
+}
+
+fn prompt_layer(
+    name: String,
+    stability: PromptLayerStability,
+    content: &str,
+) -> PromptLayerInspection {
+    PromptLayerInspection {
+        name,
+        stability,
+        char_len: content.chars().count(),
+        sha256: sha256_hex(content.as_bytes()),
+        tool_result: None,
+        turn_meta: None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Persist a SHA-addressed copy of `content` to
+/// `~/.deepseek/tool_outputs/sha_<sha>.txt` so the model can retrieve
+/// the original bytes after the wire-dedup compactor has replaced
+/// later occurrences with a `<TOOL_RESULT_REF sha="..." />` block.
+///
+/// Returns `true` when the persist succeeded (or the content is
+/// below `TOOL_RESULT_SHA_PERSIST_MIN_CHARS` — there's no retrieval
+/// need to satisfy). Returns `false` when the write failed and the
+/// caller MUST skip dedup, because emitting a SHA ref the model
+/// can't retrieve is worse than inlining the content twice. The
+/// no-home-dir edge case (InvalidInput) is treated as a real
+/// failure: we can't promise retrieval works without a writable
+/// store.
+fn persist_tool_result_for_sha(sha: &str, content: &str) -> bool {
+    if content.chars().count() < TOOL_RESULT_SHA_PERSIST_MIN_CHARS {
+        return true;
+    }
+    match crate::tools::truncate::write_sha_spillover(sha, content) {
+        Ok(_) => true,
+        Err(err) => {
+            logging::warn(format!(
+                "tool-result SHA spillover write failed for sha={sha}: {err} — dedup skipped"
+            ));
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingToolCallInfo {
+    tool_name: String,
+    input: Value,
+}
+
+struct SeenToolResult {
+    message_label: String,
+    original_chars: usize,
+}
+
+struct WireToolResult {
+    content: String,
+    original_chars: usize,
+    sent_chars: usize,
+    truncated: bool,
+    deduplicated: bool,
+}
+
+#[derive(Clone)]
+struct TurnMetaBudget {
+    original_chars: usize,
+    sent_chars: usize,
+    deduplicated: bool,
+    sha256: String,
+}
+
+struct LastFullTurnMeta {
+    sha256: String,
+}
+
+fn render_turn_meta_for_wire(
+    text: &str,
+    last_full_turn_meta: &mut Option<LastFullTurnMeta>,
+) -> (String, TurnMetaBudget) {
+    let original_chars = text.chars().count();
+    let sha = sha256_hex(text.as_bytes());
+
+    if last_full_turn_meta
+        .as_ref()
+        .is_some_and(|previous| previous.sha256 == sha)
+    {
+        // Keep the repeated metadata slot short without surfacing an
+        // opaque hash the model cannot resolve.
+        let rendered = "<turn_meta_unchanged />".to_string();
+        let budget = TurnMetaBudget {
+            original_chars,
+            sent_chars: rendered.chars().count(),
+            deduplicated: true,
+            sha256: sha,
+        };
+        return (rendered, budget);
+    }
+
+    *last_full_turn_meta = Some(LastFullTurnMeta {
+        sha256: sha.clone(),
+    });
+    (
+        text.to_string(),
+        TurnMetaBudget {
+            original_chars,
+            sent_chars: original_chars,
+            deduplicated: false,
+            sha256: sha,
+        },
+    )
+}
+
+fn is_turn_meta_text(text: &str) -> bool {
+    text.trim_start().starts_with("<turn_meta>")
+}
+
+fn turn_meta_budget_json(turn_meta: &TurnMetaBudget) -> Value {
+    json!({
+        "original_chars": turn_meta.original_chars,
+        "sent_chars": turn_meta.sent_chars,
+        "deduplicated": turn_meta.deduplicated,
+        "sha256": turn_meta.sha256,
+    })
+}
+
+/// Mutating/write tools whose result body is a *confirmation* (it embeds
+/// the unified diff + summary of what was just written), not retrievable
+/// reference data. Two identical large `write_file` calls must each keep
+/// their full confirmation inline: collapsing the later one to a
+/// `<TOOL_RESULT_REF sha="..." />` makes the model lose the write-success
+/// context and behave as if the file is missing (issue #1695). Read-style
+/// tools (`read_file`, `grep_files`, `exec_shell`, …) are unaffected and
+/// still dedup normally.
+fn is_mutation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+}
+
+fn compact_tool_result_for_wire(
+    tool_name: &str,
+    input: &Value,
+    content: &str,
+    message_label: &str,
+    seen_tool_results: &mut HashMap<String, SeenToolResult>,
+) -> WireToolResult {
+    let original_chars = content.chars().count();
+    let sha = sha256_hex(content.as_bytes());
+
+    // Two independent size-and-kind predicates, deliberately decoupled:
+    //
+    // * `persist_eligible` — size only. Any large result (including a
+    //   mutation tool's big diff) is written to the SHA-addressed store
+    //   so that, if it gets truncated below, the elided middle stays
+    //   retrievable via `retrieve_tool_result`. Mutation tools must NOT
+    //   be excluded here: a >12k-char `write_file` diff that we truncate
+    //   without persisting would leave the model unable to recover it.
+    // * `dedup_eligible` — size AND non-mutation. Only this predicate
+    //   gates collapsing a later identical result to a
+    //   `<TOOL_RESULT_REF>`. Mutation-tool results are write
+    //   *confirmations*, never dedup-eligible (#1695): two identical
+    //   large `write_file` calls must each keep their full confirmation
+    //   inline.
+    //
+    // Below the threshold, repeating the content is safer than asking
+    // the model to chase a reference, and there's no retrieval burden to
+    // satisfy, so both predicates are false.
+    let persist_eligible = original_chars >= TOOL_RESULT_DEDUP_MIN_CHARS;
+    let dedup_eligible = persist_eligible && !is_mutation_tool(tool_name);
+
+    if dedup_eligible && let Some(previous) = seen_tool_results.get(&sha) {
+        // Re-check persistence before emitting a ref. If the file is
+        // already present this is a cheap no-op; if the write now fails,
+        // inline the content rather than producing an orphan reference.
+        if !persist_tool_result_for_sha(&sha, content) {
+            return WireToolResult {
+                content: content.to_string(),
+                original_chars,
+                sent_chars: original_chars,
+                truncated: false,
+                deduplicated: false,
+            };
+        }
+        let content = format!(
+            "<TOOL_RESULT_REF sha=\"{sha}\" original_message=\"{label}\" chars=\"{chars}\">\n\
+             retrieve: retrieve_tool_result ref=sha:{sha}\n\
+             </TOOL_RESULT_REF>",
+            label = previous.message_label,
+            chars = previous.original_chars,
+        );
+        return WireToolResult {
+            sent_chars: content.chars().count(),
+            content,
+            original_chars,
+            truncated: false,
+            deduplicated: true,
+        };
+    }
+
+    if persist_eligible {
+        // Persist any large result so a later truncation below stays
+        // retrievable by SHA — this includes mutation tools, whose big
+        // diffs are NOT dedup-eligible but still must be recoverable
+        // when elided. Only register the SHA as dedup-able (eligible to
+        // be replaced by a back-reference later) when `dedup_eligible`:
+        // if the write fails, skip registration so later occurrences
+        // stay inline instead of pointing at a file that was never
+        // created.
+        let persisted = persist_tool_result_for_sha(&sha, content);
+        if persisted && dedup_eligible {
+            seen_tool_results.insert(
+                sha.clone(),
+                SeenToolResult {
+                    message_label: message_label.to_string(),
+                    original_chars,
+                },
+            );
+        }
+    }
+
+    if original_chars <= TOOL_RESULT_SENT_CHAR_BUDGET {
+        return WireToolResult {
+            content: content.to_string(),
+            original_chars,
+            sent_chars: original_chars,
+            truncated: false,
+            deduplicated: false,
+        };
+    }
+
+    let head = first_chars(content, TOOL_RESULT_HEAD_CHARS);
+    let tail = last_chars(content, TOOL_RESULT_TAIL_CHARS);
+    let kept = head.chars().count() + tail.chars().count();
+    let omitted = original_chars.saturating_sub(kept);
+    let compacted = format!(
+        "[TOOL_RESULT_TRUNCATED]\n\
+         tool_name: {tool_name}\n\
+         command_or_query: {}\n\
+         exit_status: {}\n\
+         original_chars: {original_chars}\n\
+         sha256: {sha}\n\
+         first_chars:\n\
+         {head}\n\n\
+         [... truncated {omitted} chars from middle ...]\n\n\
+         last_chars:\n\
+         {tail}",
+        tool_command_or_query(input),
+        tool_exit_status(content)
+    );
+
+    WireToolResult {
+        sent_chars: compacted.chars().count(),
+        content: compacted,
+        original_chars,
+        truncated: true,
+        deduplicated: false,
+    }
+}
+
+fn tool_command_or_query(input: &Value) -> String {
+    for key in ["command", "cmd", "query", "q", "pattern", "path", "url"] {
+        if let Some(value) = input.get(key) {
+            return summarize_for_metadata(value, 500);
+        }
+    }
+    summarize_for_metadata(input, 500)
+}
+
+fn tool_exit_status(content: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        for key in ["exit_code", "exit_status", "status", "code"] {
+            if let Some(value) = value.get(key) {
+                return summarize_for_metadata(value, 120);
+            }
+        }
+    }
+
+    for line in content.lines().take(20) {
+        let trimmed = line.trim();
+        for prefix in ["Exit code:", "exit code:", "Exit status:", "exit status:"] {
+            if let Some(value) = trimmed.strip_prefix(prefix) {
+                return value.trim().to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn summarize_for_metadata(value: &Value, max_chars: usize) -> String {
+    let raw = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    let mut summarized = first_chars(&raw.replace('\n', "\\n"), max_chars);
+    if raw.chars().count() > max_chars {
+        summarized.push_str("...");
+    }
+    summarized
+}
+
+fn first_chars(value: &str, count: usize) -> String {
+    value.chars().take(count).collect()
+}
+
+fn last_chars(value: &str, count: usize) -> String {
+    let mut chars: Vec<char> = value.chars().rev().take(count).collect();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 fn build_chat_messages_with_reasoning(
@@ -373,9 +1153,12 @@ fn build_chat_messages_with_reasoning(
     messages: &[Message],
     _model: &str,
     include_reasoning: bool,
+    include_tool_budget_metadata: bool,
 ) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut pending_tool_calls: HashSet<String> = HashSet::new();
+    let mut pending_tool_calls: HashMap<String, PendingToolCallInfo> = HashMap::new();
+    let mut seen_tool_results: HashMap<String, SeenToolResult> = HashMap::new();
+    let mut last_full_turn_meta: Option<LastFullTurnMeta> = None;
 
     if let Some(instructions) = system_to_instructions(system.cloned())
         && !instructions.trim().is_empty()
@@ -386,17 +1169,27 @@ fn build_chat_messages_with_reasoning(
         }));
     }
 
-    for message in messages.iter() {
+    for (message_index, message) in messages.iter().enumerate() {
         let role = message.role.as_str();
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
-        let mut tool_call_ids = Vec::new();
-        let mut tool_results: Vec<(String, Value)> = Vec::new();
+        let mut tool_call_infos = Vec::new();
+        let mut tool_results: Vec<(String, String, String)> = Vec::new();
+        let mut turn_meta_budget: Option<TurnMetaBudget> = None;
 
         for block in &message.content {
             match block {
-                ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
+                ContentBlock::Text { text, .. } => {
+                    if is_turn_meta_text(text) {
+                        let (rendered, budget) =
+                            render_turn_meta_for_wire(text, &mut last_full_turn_meta);
+                        text_parts.push(rendered);
+                        turn_meta_budget = Some(budget);
+                    } else {
+                        text_parts.push(text.clone());
+                    }
+                }
                 ContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
                 ContentBlock::ToolUse {
                     id,
@@ -421,21 +1214,21 @@ fn build_chat_messages_with_reasoning(
                         });
                     }
                     tool_calls.push(call);
-                    tool_call_ids.push(id.clone());
+                    tool_call_infos.push((
+                        id.clone(),
+                        PendingToolCallInfo {
+                            tool_name: name.clone(),
+                            input: input.clone(),
+                        },
+                    ));
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     ..
                 } => {
-                    tool_results.push((
-                        tool_use_id.clone(),
-                        json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": content,
-                        }),
-                    ));
+                    let message_label = format!("Message #{message_index}");
+                    tool_results.push((tool_use_id.clone(), content.clone(), message_label));
                 }
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
@@ -448,19 +1241,18 @@ fn build_chat_messages_with_reasoning(
             let mut reasoning_content = thinking_parts.join("\n");
             let has_text = !content.trim().is_empty();
             let has_tool_calls = !tool_calls.is_empty();
-            // DeepSeek thinking-mode rule: every assistant message in the
-            // conversation must carry its `reasoning_content` when thinking
-            // is enabled. The docs say non-tool-call messages' reasoning is
-            // "ignored", but the API still validates presence and rejects
-            // with a 400 if any assistant message is missing it. If reasoning
-            // was lost (e.g. a session checkpoint from before this rule was
-            // enforced, or a sub-turn with no streamed reasoning text),
-            // substitute a non-empty placeholder so the API accepts the
-            // request.
-            let include_reasoning_for_turn = include_reasoning;
-            let mut has_reasoning =
-                include_reasoning_for_turn && !reasoning_content.trim().is_empty();
-            if include_reasoning_for_turn && !has_reasoning {
+            // Reasoning replay must be a function of the stored message ONLY,
+            // never of later history. DeepSeek's prefix cache hashes the raw
+            // bytes of every message; flipping `reasoning_content` on/off
+            // depending on whether a follow-up user turn exists rewrites a
+            // historical message between turns and busts the cache from that
+            // point onwards. Always emit `reasoning_content` when the model
+            // requires replay AND the stored message carries thinking text.
+            // Tool-call messages with empty thinking still need a placeholder
+            // (DeepSeek 400s without it), but text-only assistant messages
+            // simply omit the field when there's nothing to replay.
+            let mut has_reasoning = include_reasoning && !reasoning_content.trim().is_empty();
+            if include_reasoning && has_tool_calls && !has_reasoning {
                 logging::warn(
                     "Substituting placeholder reasoning_content for DeepSeek tool-call assistant message",
                 );
@@ -492,18 +1284,34 @@ fn build_chat_messages_with_reasoning(
             }
             if has_tool_calls {
                 msg["tool_calls"] = json!(tool_calls);
-                pending_tool_calls = tool_call_ids.into_iter().collect();
+                pending_tool_calls = tool_call_infos.into_iter().collect();
             } else {
                 pending_tool_calls.clear();
             }
             out.push(msg);
+        } else if role == "system" {
+            let content = text_parts.join("\n");
+            if !content.trim().is_empty() {
+                let mut msg = json!({
+                    "role": "system",
+                    "content": content,
+                });
+                if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
+                    msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
+                }
+                out.push(msg);
+            }
         } else if role == "user" {
             let content = text_parts.join("\n");
             if !content.trim().is_empty() {
-                out.push(json!({
+                let mut msg = json!({
                     "role": "user",
                     "content": content,
-                }));
+                });
+                if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
+                    msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
+                }
+                out.push(msg);
             }
         }
 
@@ -511,8 +1319,28 @@ fn build_chat_messages_with_reasoning(
             if pending_tool_calls.is_empty() {
                 logging::warn("Dropping tool results without matching tool_calls");
             } else {
-                for (tool_id, tool_msg) in tool_results {
-                    if pending_tool_calls.remove(&tool_id) {
+                for (tool_id, content, message_label) in tool_results {
+                    if let Some(tool_info) = pending_tool_calls.remove(&tool_id) {
+                        let wire_result = compact_tool_result_for_wire(
+                            &tool_info.tool_name,
+                            &tool_info.input,
+                            &content,
+                            &message_label,
+                            &mut seen_tool_results,
+                        );
+                        let mut tool_msg = json!({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": wire_result.content,
+                        });
+                        if include_tool_budget_metadata {
+                            tool_msg["_tool_result_budget"] = json!({
+                                "original_chars": wire_result.original_chars,
+                                "sent_chars": wire_result.sent_chars,
+                                "truncated": wire_result.truncated,
+                                "deduplicated": wire_result.deduplicated,
+                            });
+                        }
                         out.push(tool_msg);
                     } else {
                         logging::warn(format!(
@@ -646,21 +1474,34 @@ pub(super) fn tool_to_chat(tool: &Tool) -> Value {
             "parameters": tool.input_schema,
         }
     });
-    if let Some(allowed_callers) = &tool.allowed_callers {
-        value["allowed_callers"] = json!(allowed_callers);
-    }
-    if let Some(defer_loading) = tool.defer_loading {
-        value["defer_loading"] = json!(defer_loading);
-    }
-    if let Some(input_examples) = &tool.input_examples {
-        value["input_examples"] = json!(input_examples);
-    }
     if let Some(strict) = tool.strict
         && let Some(function) = value.get_mut("function")
     {
         function["strict"] = json!(strict);
     }
     value
+}
+
+pub(super) fn tool_to_chat_for_base_url(tool: &Tool, base_url: &str) -> Value {
+    let mut value = tool_to_chat(tool);
+    if !deepseek_base_url_supports_strict_tools(base_url)
+        && let Some(function) = value.get_mut("function")
+        && let Some(obj) = function.as_object_mut()
+    {
+        obj.remove("strict");
+    }
+    value
+}
+
+fn deepseek_base_url_supports_strict_tools(base_url: &str) -> bool {
+    let trimmed = base_url.trim_end_matches('/').to_ascii_lowercase();
+    let is_deepseek = trimmed == "https://api.deepseek.com"
+        || trimmed == "https://api.deepseek.com/v1"
+        || trimmed == "https://api.deepseek.com/beta"
+        || trimmed == "https://api.deepseeki.com"
+        || trimmed == "https://api.deepseeki.com/v1"
+        || trimmed == "https://api.deepseeki.com/beta";
+    !is_deepseek || trimmed.ends_with("/beta")
 }
 
 fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
@@ -685,22 +1526,22 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
 }
 
 /// Final-pass sanitizer over the outgoing chat-completions JSON payload.
-/// Forces a non-empty `reasoning_content` onto every `assistant` message that
-/// carries `tool_calls`, when the model + effort combination requires it.
-/// DeepSeek's thinking-mode API rejects such messages with a 400 error;
-/// substituting a placeholder keeps the conversation chain intact.
+/// Forces a non-empty `reasoning_content` onto assistant messages that carry
+/// `tool_calls`, when the model + effort combination requires it. DeepSeek's
+/// thinking-mode API rejects such messages with a 400 error; substituting a
+/// placeholder keeps the conversation chain intact. Non-tool assistant
+/// reasoning can stay omitted once a later user text turn begins.
 ///
 /// Also tallies the size of all replayed `reasoning_content` and logs it, so
-/// users on `RUST_LOG=deepseek_tui=debug` can see how much of their input
-/// budget is being spent re-sending prior thinking traces (V4 §5.1.1
-/// "Interleaved Thinking" requires the full trace to be replayed across user
-/// message boundaries in tool-calling sessions).
+/// users on `RUST_LOG=codewhale_tui=debug` can see how much of their input
+/// budget is being spent re-sending prior thinking traces.
 pub(super) fn sanitize_thinking_mode_messages(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
+    provider: ApiProvider,
 ) -> Option<u32> {
-    if !should_replay_reasoning_content(model, effort) {
+    if !should_replay_reasoning_content_for_provider(provider, model, effort) {
         return None;
     }
     let messages = body.get_mut("messages").and_then(Value::as_array_mut)?;
@@ -711,11 +1552,12 @@ pub(super) fn sanitize_thinking_mode_messages(
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
+        let has_tool_calls = msg.get("tool_calls").is_some();
         let needs_placeholder = msg
             .get("reasoning_content")
             .and_then(Value::as_str)
             .is_none_or(|s| s.trim().is_empty());
-        if needs_placeholder {
+        if has_tool_calls && needs_placeholder {
             msg["reasoning_content"] = json!("(reasoning omitted)");
             substitutions = substitutions.saturating_add(1);
             logging::warn(format!(
@@ -805,8 +1647,7 @@ fn log_thinking_mode_violations(body: &Value) {
         let has_tc = msg.get("tool_calls").is_some();
         if reasoning.trim().is_empty() {
             violations.push(format!(
-                "assistant[{idx}] (reasoning_content missing, tool_calls={})",
-                has_tc
+                "assistant[{idx}] (reasoning_content missing, tool_calls={has_tc})"
             ));
         }
     }
@@ -825,7 +1666,16 @@ fn log_thinking_mode_violations(body: &Value) {
 
 fn requires_reasoning_content(model: &str) -> bool {
     let lower = model.to_lowercase();
+    // V4-family direct model IDs.
     lower.contains("deepseek-v4")
+        // Public DeepSeek API aliases routed server-side to the V4 family.
+        // `deepseek-chat` resolves to `deepseek-v4-flash` and `deepseek-reasoner`
+        // resolves to `deepseek-v4-pro`; both have thinking mode enabled by
+        // default, so any assistant message carrying tool_calls must replay
+        // `reasoning_content` on subsequent turns or the API returns 400.
+        || lower.starts_with("deepseek-chat")
+        || lower.starts_with("deepseek-reasoner")
+        // Generic reasoning markers used by custom/proxied deployments.
         || lower.contains("reasoner")
         || lower.contains("-reasoning")
         || lower.contains("-thinking")
@@ -846,6 +1696,57 @@ fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
     }
 
     requires_reasoning_content(model)
+}
+
+fn should_replay_reasoning_content_for_provider(
+    provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    if !provider_accepts_reasoning_content(provider) && !requires_reasoning_content(model) {
+        // Generic non-DeepSeek model on a provider that rejects the field:
+        // keep stripping it (preserves the #1542 fix). But a known DeepSeek
+        // reasoning model pointed at a DeepSeek-compatible endpoint via the
+        // generic `openai` provider still requires reasoning_content replay,
+        // or the thinking-mode API returns 400 (#1739 / #1694).
+        return false;
+    }
+    should_replay_reasoning_content(model, effort)
+}
+
+/// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
+/// (vs. inlining them as answer text)?
+///
+/// This is the streaming-path twin of `should_replay_reasoning_content_for_provider`:
+/// both must agree on whether a model is a DeepSeek-family reasoning model, or
+/// stream parsing stores reasoning tokens in `content` while the replay path
+/// expects them in `reasoning_content` (DeepSeek thinking-mode API 400s —
+/// #1739 / #1694). Like that predicate's model-aware gate, a known reasoning
+/// model is classified as such on ANY provider (including the generic `openai`
+/// provider used for DeepSeek-compatible endpoints); a genuine non-DeepSeek
+/// model is never reclassified, so #1542 is not regressed.
+///
+/// `provider_accepts_reasoning_content(provider) || requires_reasoning_content(model)`
+/// short-circuits to `requires_reasoning_content(model)` once the model gate
+/// already holds, so the effective rule is purely model-driven — kept explicit
+/// here to mirror the predicate above.
+fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
+    requires_reasoning_content(model)
+        && (provider_accepts_reasoning_content(provider) || requires_reasoning_content(model))
+}
+
+fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
+    matches!(
+        provider,
+        ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::NvidiaNim
+            | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
+            | ApiProvider::Novita
+            | ApiProvider::Fireworks
+            | ApiProvider::Sglang
+    )
 }
 
 fn has_deepseek_r_series_marker(model_lower: &str) -> bool {
@@ -913,11 +1814,11 @@ pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
                 .unwrap_or("tool_call")
                 .to_string();
             let function = call.get("function");
-            let name = function
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string();
+            let name = tool_name_or_fallback(
+                function.and_then(|f| f.get("name")).and_then(Value::as_str),
+                &id,
+                "Non-streaming response",
+            );
             let arguments = function
                 .and_then(|f| f.get("arguments"))
                 .and_then(Value::as_str)
@@ -1103,11 +2004,14 @@ pub(super) fn parse_sse_chunk(
             .map(str::to_string);
 
         if let Some(delta) = delta {
+            let reasoning_text = reasoning_field(delta).filter(|s| !s.is_empty());
+            let content_text = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+
             // Handle reasoning_content / reasoning thinking deltas.
-            if is_reasoning_model
-                && let Some(reasoning) = reasoning_field(delta)
-                && !reasoning.is_empty()
-            {
+            if is_reasoning_model && let Some(reasoning) = reasoning_text {
                 if !*thinking_started {
                     events.push(StreamEvent::ContentBlockStart {
                         index: *content_index,
@@ -1125,10 +2029,18 @@ pub(super) fn parse_sse_chunk(
                 });
             }
 
+            // Generic OpenAI-compatible proxies sometimes stream answer text
+            // in `reasoning_content`. If this provider is not one whose
+            // reasoning-content semantics we support, render that field as
+            // normal text when no `content` delta is present.
+            let effective_content = match content_text {
+                Some(content) => Some(content),
+                None if !is_reasoning_model => reasoning_text,
+                None => None,
+            };
+
             // Handle regular content
-            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                && !content.is_empty()
-            {
+            if let Some(content) = effective_content {
                 // Close thinking block if transitioning to text
                 if *thinking_started {
                     events.push(StreamEvent::ContentBlockStop {
@@ -1195,9 +2107,8 @@ pub(super) fn parse_sse_chunk(
                             let name = tc
                                 .get("function")
                                 .and_then(|f| f.get("name"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
+                                .and_then(Value::as_str);
+                            let name = tool_name_or_fallback(name, &id, "Streaming response chunk");
                             let caller = tc.get("caller").and_then(|v| {
                                 v.get("type").and_then(Value::as_str).map(|caller_type| {
                                     ToolCaller {
@@ -1283,12 +2194,45 @@ pub(super) fn parse_sse_chunk(
     events
 }
 
+fn tool_name_or_fallback(name: Option<&str>, id: &str, source: &str) -> String {
+    let trimmed = name.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        logging::warn(format!(
+            "{source} returned an empty tool name for call {id}; using unknown_tool"
+        ));
+        "unknown_tool".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // === #103 Phase 1: stream-decode diagnostics ===================================
 
 #[cfg(test)]
 mod stream_diagnostics_tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn stream_open_timeout_defaults_and_clamps_env_values() {
+        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(45));
+        assert_eq!(
+            stream_open_timeout_from_env(Some("not-a-number")),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            stream_open_timeout_from_env(Some("1")),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            stream_open_timeout_from_env(Some("120")),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            stream_open_timeout_from_env(Some("999")),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn format_stream_headers_renders_all_fields_when_present() {
@@ -1368,6 +2312,10 @@ mod stream_decoder_tests {
     /// Decode a raw SSE-data JSON chunk into our internal events, mirroring
     /// the per-event call shape used by `handle_chat_completion_stream`.
     fn decode_chunk(json_text: &str) -> Vec<StreamEvent> {
+        decode_chunk_with_reasoning(json_text, true)
+    }
+
+    fn decode_chunk_with_reasoning(json_text: &str, is_reasoning_model: bool) -> Vec<StreamEvent> {
         let chunk: Value = serde_json::from_str(json_text).expect("valid SSE JSON");
         let mut content_index = 0u32;
         let mut text_started = false;
@@ -1379,7 +2327,7 @@ mod stream_decoder_tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
-            true,
+            is_reasoning_model,
         )
     }
 
@@ -1438,6 +2386,63 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn decoder_accepts_openrouter_reasoning_delta_with_extra_fields() {
+        let events = decode_chunk(
+            r#"{"id":"or-1","choices":[{"delta":{"reasoning":"openrouter thought","reasoning_details":[{"type":"summary","text":"extra"}],"native_finish_reason":null}}],"usage":{"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } if thinking == "openrouter thought"
+            )),
+            "OpenRouter-style reasoning deltas with extra fields should not crash decoding; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_treats_reasoning_content_as_text_when_provider_does_not_support_reasoning() {
+        let events = decode_chunk_with_reasoning(
+            r#"{"choices":[{"delta":{"reasoning_content":"hello"}}]}"#,
+            false,
+        );
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::Text { .. },
+                    ..
+                })
+            ),
+            "first event should open a text block; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                } if text == "hello"
+            )),
+            "should yield a TextDelta carrying 'hello'; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { .. },
+                    ..
+                }
+            )),
+            "should not emit thinking deltas for generic providers; got {events:?}"
+        );
+    }
+
+    #[test]
     fn decoder_yields_no_events_for_keepalive_chunk() {
         // DeepSeek often sends `{"choices":[]}` keepalive chunks before
         // emitting real content. The engine MUST treat a stream error after
@@ -1478,6 +2483,53 @@ mod stream_decoder_tests {
             )),
             "should yield InputJsonDelta carrying the tool args; got {events:?}"
         );
+    }
+
+    #[test]
+    fn decoder_uses_fallback_name_for_empty_streaming_tool_name() {
+        let events = decode_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_empty","function":{"name":"","arguments":"{}"}}]}}]}"#,
+        );
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::ToolUse { name, .. },
+                    ..
+                } if name == "unknown_tool"
+            )),
+            "empty upstream tool names should render as unknown_tool; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_uses_fallback_name_for_missing_tool_name() {
+        let payload: Value = serde_json::from_str(
+            r#"{
+                "id": "chatcmpl_1",
+                "model": "deepseek-v4-pro",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_missing",
+                            "function": { "arguments": "{}" }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        )
+        .expect("valid response");
+
+        let parsed = parse_chat_message(&payload).expect("message parses");
+        let tool_name = parsed.content.iter().find_map(|block| match block {
+            ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+
+        assert_eq!(tool_name, Some("unknown_tool"));
     }
 
     /// Regression for the parallel-tool-calls-without-id collision (audit
@@ -1538,5 +2590,718 @@ mod stream_decoder_tests {
             })
             .expect("tool-use block present");
         assert_eq!(id, "call_xyz");
+    }
+
+    #[test]
+    fn request_builder_preserves_internal_system_messages() {
+        let messages = vec![Message {
+            role: "system".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "internal runtime event".to_string(),
+                cache_control: None,
+            }],
+        }];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0]["role"], "system");
+        assert_eq!(built[0]["content"], "internal runtime event");
+    }
+
+    fn tool_use_message(id: &str, name: &str, input: Value) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+                caller: None,
+            }],
+        }
+    }
+
+    fn tool_result_message(id: &str, content: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        }
+    }
+
+    fn user_message_with_turn_meta(turn_meta: &str, task: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: turn_meta.to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::Text {
+                    text: task.to_string(),
+                    cache_control: None,
+                },
+            ],
+        }
+    }
+
+    fn tool_message_content(messages: &[Value], index: usize) -> &str {
+        messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .nth(index)
+            .and_then(|message| message.get("content").and_then(Value::as_str))
+            .expect("tool message content")
+    }
+
+    fn user_message_content(messages: &[Value], index: usize) -> &str {
+        messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .nth(index)
+            .and_then(|message| message.get("content").and_then(Value::as_str))
+            .expect("user message content")
+    }
+
+    fn with_tool_result_sha_spillover_root<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(
+            tmp.path().join(".deepseek").join("tool_outputs"),
+        ));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+        f()
+    }
+
+    #[test]
+    fn request_builder_deduplicates_consecutive_identical_turn_meta_for_wire() {
+        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
+        let messages = vec![
+            user_message_with_turn_meta(turn_meta, "first task"),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first answer".to_string(),
+                    cache_control: None,
+                }],
+            },
+            user_message_with_turn_meta(turn_meta, "second task"),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = user_message_content(&built, 0);
+        let second = user_message_content(&built, 1);
+        let expected_ref = "<turn_meta_unchanged />";
+
+        assert!(first.starts_with(turn_meta), "got: {first}");
+        assert!(second.starts_with(expected_ref), "got: {second}");
+        assert!(second.ends_with("second task"), "got: {second}");
+        assert_eq!(
+            second,
+            format!("{expected_ref}\nsecond task"),
+            "ref text must stay stable"
+        );
+    }
+
+    #[test]
+    fn request_builder_keeps_changed_turn_meta_full_and_updates_recent_hash() {
+        let first_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
+        let second_meta =
+            "<turn_meta>\nCurrent local date: 2026-05-09\nWorking set: src/lib.rs\n</turn_meta>";
+        let messages = vec![
+            user_message_with_turn_meta(first_meta, "first task"),
+            user_message_with_turn_meta(second_meta, "second task"),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = user_message_content(&built, 0);
+        let second = user_message_content(&built, 1);
+
+        assert!(first.starts_with(first_meta), "got: {first}");
+        assert!(second.starts_with(second_meta), "got: {second}");
+        assert!(!second.contains("<TURN_META_REF"), "got: {second}");
+    }
+
+    #[test]
+    fn turn_meta_dedup_is_wire_only_and_does_not_mutate_session_message() {
+        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
+        let messages = vec![
+            user_message_with_turn_meta(turn_meta, "first task"),
+            user_message_with_turn_meta(turn_meta, "second task"),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        assert!(
+            user_message_content(&built, 1).starts_with("<turn_meta_unchanged />"),
+            "got: {}",
+            user_message_content(&built, 1)
+        );
+
+        match &messages[1].content[0] {
+            ContentBlock::Text { text, .. } => assert_eq!(text, turn_meta),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_inspect_reports_turn_meta_dedup_metadata() {
+        let turn_meta = format!(
+            "<turn_meta>\nCurrent local date: 2026-05-09\n{}\n</turn_meta>",
+            "Working set: src/lib.rs\n".repeat(20)
+        );
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                user_message_with_turn_meta(&turn_meta, "first task"),
+                user_message_with_turn_meta(&turn_meta, "second task"),
+            ],
+            max_tokens: 0,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let inspection = inspect_prompt_for_request(&request);
+        let turn_meta_layers: Vec<_> = inspection
+            .layers
+            .iter()
+            .filter_map(|layer| layer.turn_meta.as_ref())
+            .collect();
+
+        assert_eq!(turn_meta_layers.len(), 2);
+        assert_eq!(
+            turn_meta_layers[0].original_chars,
+            turn_meta.chars().count()
+        );
+        assert_eq!(turn_meta_layers[0].sent_chars, turn_meta.chars().count());
+        assert!(!turn_meta_layers[0].deduplicated);
+        assert_eq!(turn_meta_layers[0].sha256, sha256_hex(turn_meta.as_bytes()));
+        assert_eq!(
+            turn_meta_layers[1].original_chars,
+            turn_meta.chars().count()
+        );
+        assert!(turn_meta_layers[1].sent_chars < turn_meta_layers[1].original_chars);
+        assert!(turn_meta_layers[1].deduplicated);
+        assert_eq!(turn_meta_layers[1].sha256, turn_meta_layers[0].sha256);
+    }
+
+    #[test]
+    fn request_builder_truncates_large_tool_result_for_wire() {
+        let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+        let messages = vec![
+            tool_use_message(
+                "tool-long",
+                "shell_command",
+                json!({"command": "cargo test"}),
+            ),
+            tool_result_message("tool-long", &long_output),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let sent = tool_message_content(&built, 0);
+
+        assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
+        assert!(sent.contains("tool_name: shell_command"), "got: {sent}");
+        assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
+        assert!(sent.contains("original_chars: 14000"), "got: {sent}");
+        assert!(sent.contains("sha256:"), "got: {sent}");
+        assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
+        assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
+        assert!(
+            sent.contains("truncated 6000 chars from middle"),
+            "got: {sent}"
+        );
+        assert_ne!(sent, long_output);
+    }
+
+    #[test]
+    fn request_builder_does_not_dedup_short_tool_results_for_wire() {
+        let output = "same tool output";
+        let messages = vec![
+            tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
+            tool_result_message("tool-1", output),
+            tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
+            tool_result_message("tool-2", output),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = tool_message_content(&built, 0);
+        let second = tool_message_content(&built, 1);
+
+        assert_eq!(first, output);
+        assert_eq!(second, output);
+        assert!(!second.contains("<TOOL_RESULT_REF"), "got: {second}");
+    }
+
+    #[test]
+    fn request_builder_deduplicates_large_identical_tool_results_with_retrieval_hint() {
+        with_tool_result_sha_spillover_root(|| {
+            let output = "A".repeat(2_000);
+            let messages = vec![
+                tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
+                tool_result_message("tool-1", &output),
+                tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
+                tool_result_message("tool-2", &output),
+            ];
+
+            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+            let first = tool_message_content(&built, 0);
+            let second = tool_message_content(&built, 1);
+
+            assert_eq!(first, output);
+            assert!(
+                second.starts_with("<TOOL_RESULT_REF sha=\""),
+                "got: {second}"
+            );
+            assert!(
+                second.contains("original_message=\"Message #1\""),
+                "got: {second}"
+            );
+            assert!(second.contains("chars=\"2000\""), "got: {second}");
+            assert!(
+                second.contains("retrieve: retrieve_tool_result ref=sha:"),
+                "got: {second}"
+            );
+        });
+    }
+
+    #[test]
+    fn request_builder_never_dedups_large_identical_write_file_confirmations() {
+        with_tool_result_sha_spillover_root(|| {
+            // A `write_file` result embeds the unified diff + summary; it is a
+            // confirmation, not retrievable data. Two identical >1024-char
+            // write_file results must BOTH stay inline — collapsing the second
+            // to a SHA ref makes the model lose write-success context and
+            // report the file as missing (#1695).
+            let output = "A".repeat(2_000);
+            let messages = vec![
+                tool_use_message("tool-1", "write_file", json!({"path": "big.txt"})),
+                tool_result_message("tool-1", &output),
+                tool_use_message("tool-2", "write_file", json!({"path": "big.txt"})),
+                tool_result_message("tool-2", &output),
+            ];
+
+            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+            let first = tool_message_content(&built, 0);
+            let second = tool_message_content(&built, 1);
+
+            assert_eq!(first, output);
+            assert_eq!(second, output);
+            assert!(!second.contains("<TOOL_RESULT_REF"), "got: {second}");
+
+            // Non-mutation tools still dedup: an identical large read_file
+            // result collapses to a retrievable SHA ref.
+            let read_messages = vec![
+                tool_use_message("read-1", "read_file", json!({"path": "README.md"})),
+                tool_result_message("read-1", &output),
+                tool_use_message("read-2", "read_file", json!({"path": "README.md"})),
+                tool_result_message("read-2", &output),
+            ];
+            let read_built = build_chat_messages(None, &read_messages, "deepseek-v4-flash");
+            let read_first = tool_message_content(&read_built, 0);
+            let read_second = tool_message_content(&read_built, 1);
+            assert_eq!(read_first, output);
+            assert!(
+                read_second.starts_with("<TOOL_RESULT_REF sha=\""),
+                "got: {read_second}"
+            );
+        });
+    }
+
+    #[test]
+    fn large_write_file_result_stays_inline_but_is_persisted_for_retrieval() {
+        // Decoupling regression (#1695 follow-up): a SINGLE very large
+        // `write_file` result must (a) never collapse to a
+        // `<TOOL_RESULT_REF>` (mutation confirmations stay inline) yet
+        // (b) still be persisted to the SHA store so the content elided
+        // by truncation remains retrievable via `retrieve_tool_result`.
+        // Before the fix, folding `!is_mutation_tool` into the single
+        // `dedup_eligible` gate also disabled persistence, so a >12k
+        // mutation diff was truncated AND unrecoverable.
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(
+            tmp.path().join(".deepseek").join("tool_outputs"),
+        ));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        // > TOOL_RESULT_SENT_CHAR_BUDGET (12_000) so the wire path
+        // truncates and would need a SHA to recover the middle.
+        let big_diff = "D".repeat(20_000);
+        let sha = sha256_hex(big_diff.as_bytes());
+
+        let messages = vec![
+            tool_use_message("w-1", "write_file", json!({"path": "huge.rs"})),
+            tool_result_message("w-1", &big_diff),
+            tool_use_message("w-2", "write_file", json!({"path": "huge.rs"})),
+            tool_result_message("w-2", &big_diff),
+        ];
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = tool_message_content(&built, 0);
+        let second = tool_message_content(&built, 1);
+
+        // (a) Both confirmations stay inline — truncated, never a ref.
+        assert!(
+            first.contains("[TOOL_RESULT_TRUNCATED]"),
+            "first should be truncated, got: {first}"
+        );
+        assert!(
+            !first.contains("<TOOL_RESULT_REF"),
+            "first must not be a dedup ref, got: {first}"
+        );
+        assert!(
+            !second.contains("<TOOL_RESULT_REF"),
+            "second identical write_file must stay inline (#1695), got: {second}"
+        );
+        assert!(
+            second.contains("[TOOL_RESULT_TRUNCATED]"),
+            "second should also be inline-truncated, got: {second}"
+        );
+        assert!(
+            first.contains(&format!("sha256: {sha}")),
+            "truncation block should advertise the recovery SHA, got: {first}"
+        );
+
+        // (b) The full content was persisted to the SHA store and is
+        // retrievable — the seam `persist_tool_result_for_sha` writes
+        // to and `retrieve_tool_result ref=sha:` reads back from.
+        let path = crate::tools::truncate::sha_spillover_path(&sha)
+            .expect("sha spillover path resolvable under test root");
+        assert!(
+            path.exists(),
+            "large write_file output not persisted: {path:?}"
+        );
+        let persisted = std::fs::read_to_string(&path).expect("read persisted spillover");
+        assert_eq!(
+            persisted, big_diff,
+            "persisted content must match the original write_file result verbatim"
+        );
+
+        // Sanity: a large NON-mutation result still dedups (back-ref on
+        // the second sighting) — decoupling didn't regress #1695's
+        // preserved read-path behavior.
+        let read_messages = vec![
+            tool_use_message("r-1", "read_file", json!({"path": "huge.rs"})),
+            tool_result_message("r-1", &big_diff),
+            tool_use_message("r-2", "read_file", json!({"path": "huge.rs"})),
+            tool_result_message("r-2", &big_diff),
+        ];
+        let read_built = build_chat_messages(None, &read_messages, "deepseek-v4-flash");
+        let read_second = tool_message_content(&read_built, 1);
+        assert!(
+            read_second.starts_with("<TOOL_RESULT_REF sha=\""),
+            "large read_file must still dedup to a ref, got: {read_second}"
+        );
+    }
+
+    #[test]
+    fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
+        let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+        let messages = vec![
+            tool_use_message(
+                "tool-long",
+                "shell_command",
+                json!({"command": "cargo test"}),
+            ),
+            tool_result_message("tool-long", &long_output),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let sent = tool_message_content(&built, 0);
+        assert_ne!(sent, long_output);
+
+        match &messages[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => assert_eq!(content, &long_output),
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_inspect_reports_tool_result_budget_metadata() {
+        with_tool_result_sha_spillover_root(|| {
+            let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+            let request = MessageRequest {
+                model: "deepseek-v4-flash".to_string(),
+                messages: vec![
+                    tool_use_message("tool-1", "shell_command", json!({"command": "cargo test"})),
+                    tool_result_message("tool-1", &long_output),
+                    tool_use_message("tool-2", "shell_command", json!({"command": "cargo test"})),
+                    tool_result_message("tool-2", &long_output),
+                ],
+                max_tokens: 0,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                metadata: None,
+                thinking: None,
+                reasoning_effort: None,
+                stream: None,
+                temperature: None,
+                top_p: None,
+            };
+
+            let inspection = inspect_prompt_for_request(&request);
+            let tool_layers: Vec<_> = inspection
+                .layers
+                .iter()
+                .filter_map(|layer| layer.tool_result.as_ref())
+                .collect();
+
+            assert_eq!(tool_layers.len(), 2);
+            assert_eq!(tool_layers[0].original_chars, 14_000);
+            assert!(tool_layers[0].sent_chars < tool_layers[0].original_chars);
+            assert!(tool_layers[0].truncated);
+            assert!(!tool_layers[0].deduplicated);
+            assert_eq!(tool_layers[1].original_chars, 14_000);
+            // Keep the reference far smaller than the original 14K output
+            // even with a copyable retrieval hint included.
+            assert!(
+                tool_layers[1].sent_chars < 300,
+                "deduplicated ref grew unexpectedly large: {}",
+                tool_layers[1].sent_chars
+            );
+            assert!(!tool_layers[1].truncated);
+            assert!(tool_layers[1].deduplicated);
+        });
+    }
+}
+
+#[cfg(test)]
+mod alias_thinking_detection_tests {
+    //! Regression coverage for the DeepSeek public model aliases.
+    //!
+    //! `deepseek-chat` and `deepseek-reasoner` are the canonical alias names
+    //! published in DeepSeek's API docs. Server-side they resolve to V4-flash
+    //! and V4-pro respectively, both of which have thinking mode enabled by
+    //! default. If the TUI does not classify those aliases as reasoning
+    //! models, the sanitizer skips replaying `reasoning_content` on tool-call
+    //! assistant messages and DeepSeek returns a 400 ("the `reasoning_content`
+    //! in the thinking mode must be passed back to the API") on the second
+    //! turn. See upstream API docs:
+    //! https://api-docs.deepseek.com/guides/thinking_mode
+    use super::{
+        apply_provider_token_limit, is_reasoning_model_for_stream,
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+    };
+    use crate::config::ApiProvider;
+    use serde_json::json;
+
+    #[test]
+    fn aliases_routed_to_v4_require_reasoning_content() {
+        // Documented public aliases.
+        assert!(requires_reasoning_content("deepseek-chat"));
+        assert!(requires_reasoning_content("deepseek-reasoner"));
+        // Case-insensitive: users sometimes copy/paste with capitalisation.
+        assert!(requires_reasoning_content("DeepSeek-Chat"));
+        assert!(requires_reasoning_content("DEEPSEEK-REASONER"));
+    }
+
+    #[test]
+    fn explicit_v4_ids_still_require_reasoning_content() {
+        // Direct V4 IDs continue to match (regression guard for the existing
+        // `lower.contains("deepseek-v4")` branch).
+        assert!(requires_reasoning_content("deepseek-v4-flash"));
+        assert!(requires_reasoning_content("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn non_thinking_aliases_remain_excluded() {
+        // Legacy non-thinking IDs and unrelated provider models must not be
+        // misclassified, otherwise we would force a placeholder
+        // `reasoning_content` on providers that reject the field.
+        assert!(!requires_reasoning_content("deepseek-v3"));
+        assert!(!requires_reasoning_content("deepseek-coder"));
+        assert!(!requires_reasoning_content("qwen3-coder"));
+        assert!(!requires_reasoning_content("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn alias_prefix_handles_suffixed_variants() {
+        // OpenRouter / proxy deployments occasionally suffix the canonical
+        // alias (e.g. `deepseek-chat:free`). Those routes still hit V4
+        // server-side, so they must continue to require reasoning_content.
+        assert!(requires_reasoning_content("deepseek-chat:free"));
+        assert!(requires_reasoning_content("deepseek-reasoner-2025-05"));
+    }
+
+    #[test]
+    fn explicit_reasoning_off_overrides_alias_detection() {
+        // `reasoning_effort = "off"` is the documented escape hatch: even when
+        // the model is in the thinking family, the user can opt out and the
+        // sanitizer must respect that choice.
+        assert!(!should_replay_reasoning_content(
+            "deepseek-chat",
+            Some("off")
+        ));
+        assert!(!should_replay_reasoning_content(
+            "deepseek-reasoner",
+            Some("disabled")
+        ));
+        // Without an explicit override, alias models still trigger replay.
+        assert!(should_replay_reasoning_content("deepseek-chat", None));
+        assert!(should_replay_reasoning_content(
+            "deepseek-reasoner",
+            Some("medium")
+        ));
+    }
+
+    #[test]
+    fn generic_openai_provider_does_not_accept_reasoning_content_semantics() {
+        assert!(!provider_accepts_reasoning_content(ApiProvider::Openai));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Deepseek));
+        assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
+        assert!(provider_accepts_reasoning_content(ApiProvider::XiaomiMimo));
+    }
+
+    #[test]
+    fn xiaomi_mimo_uses_max_completion_tokens_payload_key() {
+        let mut body = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [],
+            "max_tokens": 8192,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, 8192);
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn deepseek_model_on_openai_provider_still_replays_reasoning_content() {
+        // #1739 / #1694: a DeepSeek thinking model pointed at a
+        // DeepSeek-compatible endpoint via the generic `openai` provider must
+        // still replay reasoning_content, even though the provider itself does
+        // not accept the field. Otherwise the thinking-mode API returns 400.
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "deepseek-v4-flash",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "deepseek-v4-pro",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "deepseek-reasoner",
+            Some("medium"),
+        ));
+        // The documented escape hatch still wins over model detection.
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "deepseek-v4-flash",
+            Some("off"),
+        ));
+    }
+
+    #[test]
+    fn generic_model_on_openai_provider_still_strips_reasoning_content() {
+        // #1542 no-regression guard: a genuine non-DeepSeek model on the
+        // openai provider must continue to have reasoning_content stripped.
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "qwen3-coder",
+            None,
+        ));
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "claude-sonnet-4-6",
+            None,
+        ));
+    }
+
+    #[test]
+    fn stream_classifies_deepseek_model_on_openai_provider_as_reasoning() {
+        // #1739: the SSE parser must treat a DeepSeek thinking model on the
+        // generic `openai` provider (DeepSeek-compatible endpoint) as a
+        // reasoning model, or incoming `reasoning_content` tokens are stored
+        // as answer text and the subsequent replay still 400s.
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Openai,
+            "deepseek-v4-flash"
+        ));
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Openai,
+            "deepseek-v4-pro"
+        ));
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Openai,
+            "deepseek-reasoner"
+        ));
+        // Native DeepSeek provider was already correct; stays correct.
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro"
+        ));
+    }
+
+    #[test]
+    fn stream_does_not_classify_generic_model_as_reasoning() {
+        // #1542 no-regression guard: a genuine non-DeepSeek model on the
+        // openai provider must NOT be treated as a reasoning model, so the
+        // parser keeps inlining any `reasoning_content` it emits as text.
+        assert!(!is_reasoning_model_for_stream(
+            ApiProvider::Openai,
+            "qwen3-coder"
+        ));
+        assert!(!is_reasoning_model_for_stream(
+            ApiProvider::Openai,
+            "claude-sonnet-4-6"
+        ));
+        // Non-DeepSeek model on a reasoning-aware provider is also unchanged.
+        assert!(!is_reasoning_model_for_stream(
+            ApiProvider::Deepseek,
+            "qwen3-coder"
+        ));
+    }
+
+    #[test]
+    fn stream_classification_matches_replay_predicate() {
+        // The streaming classifier and the replay predicate must agree on
+        // model identity, or stream parsing and message sanitisation disagree
+        // about where reasoning tokens live. Effort=None isolates the
+        // model/provider dimension shared by both.
+        for model in ["deepseek-v4-pro", "deepseek-reasoner", "qwen3-coder"] {
+            for provider in [ApiProvider::Openai, ApiProvider::Deepseek] {
+                assert_eq!(
+                    is_reasoning_model_for_stream(provider, model),
+                    should_replay_reasoning_content_for_provider(provider, model, None),
+                    "stream vs replay disagree for {model} on {provider:?}"
+                );
+            }
+        }
     }
 }

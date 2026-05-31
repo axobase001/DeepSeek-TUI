@@ -5,9 +5,13 @@
 //! or whenever a tool requests live user input (`await_user_input`). Channels
 //! and engine state stay private to the parent module.
 
+use std::time::Duration;
+
 use crate::core::events::Event;
 use crate::tools::spec::ToolError;
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
+
+const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::Engine;
 
@@ -49,6 +53,21 @@ pub(super) enum ApprovalResult {
 }
 
 impl Engine {
+    /// Format a cancellation suffix when the engine knows the cause.
+    /// Some internal cancellation paths still use the raw token while
+    /// #1541 is open; those keep the legacy message without a guessed
+    /// reason.
+    fn cancel_reason_suffix(&self) -> String {
+        let reason = match self.cancel_reason.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        match reason {
+            Some(reason) => format!(" (reason: {})", reason.describe()),
+            None => String::new(),
+        }
+    }
+
     pub(super) async fn await_tool_approval(
         &mut self,
         tool_id: &str,
@@ -56,14 +75,18 @@ impl Engine {
         loop {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
+                    let suffix = self.cancel_reason_suffix();
                     return Err(ToolError::execution_failed(
-                        "Request cancelled while awaiting approval".to_string(),
+                        format!("Request cancelled while awaiting approval{suffix}"),
                     ));
                 }
                 decision = self.rx_approval.recv() => {
                     let Some(decision) = decision else {
                         return Err(ToolError::execution_failed(
-                            "Approval channel closed".to_string(),
+                            "Approval channel closed — engine is shutting down. \
+                             The approval modal can no longer reach the engine; \
+                             this is typically a teardown race, not a user action."
+                                .to_string(),
                         ));
                     };
                     match decision {
@@ -99,26 +122,48 @@ impl Engine {
         loop {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
+                    let suffix = self.cancel_reason_suffix();
                     return Err(ToolError::execution_failed(
-                        "Request cancelled while awaiting user input".to_string(),
+                        format!("Request cancelled while awaiting user input{suffix}"),
                     ));
                 }
-                decision = self.rx_user_input.recv() => {
-                    let Some(decision) = decision else {
-                        return Err(ToolError::execution_failed(
-                            "User input channel closed".to_string(),
-                        ));
-                    };
-                    match decision {
-                        UserInputDecision::Submitted { id, response } if id == tool_id => {
-                            return Ok(response);
+                result = tokio::time::timeout(USER_INPUT_TIMEOUT, self.rx_user_input.recv()) => {
+                    match result {
+                        Ok(Some(decision)) => {
+                            match decision {
+                                UserInputDecision::Submitted { id, response } if id == tool_id => {
+                                    return Ok(response);
+                                }
+                                UserInputDecision::Cancelled { id } if id == tool_id => {
+                                    return Err(ToolError::execution_failed(
+                                        "User input cancelled".to_string(),
+                                    ));
+                                }
+                                _ => continue,
+                            }
                         }
-                        UserInputDecision::Cancelled { id } if id == tool_id => {
+                        Ok(None) => {
                             return Err(ToolError::execution_failed(
-                                "User input cancelled".to_string(),
+                                "User input channel closed".to_string(),
                             ));
                         }
-                        _ => continue,
+                        Err(_) => {
+                            let _ = self
+                                .tx_event
+                                .send(Event::Status {
+                                    message: format!(
+                                        "User input timed out after {}s",
+                                        USER_INPUT_TIMEOUT.as_secs()
+                                    ),
+                                })
+                                .await;
+                            return Err(ToolError::execution_failed(
+                                format!(
+                                    "User input timed out after {}s",
+                                    USER_INPUT_TIMEOUT.as_secs()
+                                ),
+                            ));
+                        }
                     }
                 }
             }

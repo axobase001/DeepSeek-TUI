@@ -1,25 +1,95 @@
 //! DeepSeek color palette and semantic roles.
 
 use ratatui::style::Color;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
-pub const DEEPSEEK_BLUE_RGB: (u8, u8, u8) = (53, 120, 229); // #3578E5
-pub const DEEPSEEK_SKY_RGB: (u8, u8, u8) = (106, 174, 242);
+// v0.8.46 Whale dark palette — improved contrast and layer separation.
+pub const WHALE_BG_RGB: (u8, u8, u8) = (10, 17, 32); // #0A1120 Deep Navy
+pub const WHALE_PANEL_RGB: (u8, u8, u8) = (22, 34, 56); // #162238
+pub const WHALE_ELEVATED_RGB: (u8, u8, u8) = (36, 52, 78); // #24344E
+pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (40, 56, 84); // #283854 — darker to avoid bright pop on deep navy
+pub const WHALE_TEXT_BODY_RGB: (u8, u8, u8) = (246, 242, 232); // #F6F2E8 Whale Ivory
+pub const WHALE_TEXT_SOFT_RGB: (u8, u8, u8) = (217, 224, 234); // #D9E0EA
+pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (169, 180, 199); // #A9B4C7 Mist Gray
+pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (138, 150, 174); // #8A96AE
+#[allow(dead_code)]
+pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (118, 130, 156); // #76829C
+pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
+pub const WHALE_ACCENT_SECONDARY_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
+pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = (255, 122, 89); // #FF7A59 Coral Spark
+pub const WHALE_ERROR_RGB: (u8, u8, u8) = (255, 92, 122); // #FF5C7A Rose Red
+pub const WHALE_ERROR_HOVER_RGB: (u8, u8, u8) = (255, 120, 144); // #FF7890 Rose Hover
+pub const WHALE_ERROR_SURFACE_RGB: (u8, u8, u8) = (42, 18, 26); // #2A121A Error Surface
+pub const WHALE_ERROR_BORDER_RGB: (u8, u8, u8) = (255, 138, 160); // #FF8AA0 Error Border
+pub const WHALE_ERROR_TEXT_RGB: (u8, u8, u8) = (255, 214, 222); // #FFD6DE Error Text
+pub const WHALE_WARNING_RGB: (u8, u8, u8) = (240, 160, 48); // #F0A030
+pub const WHALE_SUCCESS_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
+pub const WHALE_INFO_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Sky
+pub const WHALE_BORDER_RGB: (u8, u8, u8) = (52, 88, 145); // #345891
+pub const WHALE_REASONING_TEXT_RGB: (u8, u8, u8) = (224, 153, 72); // #E09948
+pub const WHALE_REASONING_SURFACE_RGB: (u8, u8, u8) = (42, 34, 24); // #2A2218
+pub const WHALE_REASONING_TINT_RGB: (u8, u8, u8) = (24, 36, 52); // #182434
+pub const WHALE_DIFF_ADDED_RGB: (u8, u8, u8) = (87, 199, 133); // #57C785
+#[allow(dead_code)]
+pub const WHALE_DIFF_DELETED_RGB: (u8, u8, u8) = (255, 92, 122); // #FF5C7A Rose Red
+pub const WHALE_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (18, 42, 34); // #122A22
+pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (42, 18, 26); // #2A121A
+pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = (80, 150, 255); // #5096FF
+pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 100, 100); // #FF6464
+pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
+pub const WHALE_MODE_GOAL_RGB: (u8, u8, u8) = (100, 220, 160); // #64DCA0
+pub const WHALE_TOOL_LIVE_RGB: (u8, u8, u8) = (140, 190, 238); // #8CBEEE
+pub const WHALE_TOOL_ISSUE_RGB: (u8, u8, u8) = (198, 150, 160); // #C696A0
+pub const WHALE_TOOL_OUTPUT_RGB: (u8, u8, u8) = (194, 208, 224); // #C2D0E0
+pub const WHALE_TOOL_SURFACE_RGB: (u8, u8, u8) = (28, 40, 62); // #1C283E
+pub const WHALE_TOOL_ACTIVE_RGB: (u8, u8, u8) = (38, 54, 80); // #263650
+
+// Backward-compatible aliases for existing call sites.
+pub const DEEPSEEK_BLUE_RGB: (u8, u8, u8) = WHALE_ACCENT_PRIMARY_RGB;
+pub const DEEPSEEK_SKY_RGB: (u8, u8, u8) = WHALE_INFO_RGB;
 #[allow(dead_code)]
 pub const DEEPSEEK_AQUA_RGB: (u8, u8, u8) = (54, 187, 212);
 #[allow(dead_code)]
 pub const DEEPSEEK_NAVY_RGB: (u8, u8, u8) = (24, 63, 138);
-pub const DEEPSEEK_INK_RGB: (u8, u8, u8) = (11, 21, 38);
-pub const DEEPSEEK_SLATE_RGB: (u8, u8, u8) = (18, 28, 46);
-pub const DEEPSEEK_RED_RGB: (u8, u8, u8) = (226, 80, 96);
+pub const DEEPSEEK_INK_RGB: (u8, u8, u8) = WHALE_BG_RGB;
+pub const DEEPSEEK_SLATE_RGB: (u8, u8, u8) = WHALE_PANEL_RGB;
+pub const DEEPSEEK_RED_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
+
+pub const LIGHT_SURFACE_RGB: (u8, u8, u8) = (246, 248, 251); // #F6F8FB
+pub const LIGHT_PANEL_RGB: (u8, u8, u8) = (236, 242, 248); // #ECF2F8
+pub const LIGHT_ELEVATED_RGB: (u8, u8, u8) = (219, 229, 240); // #DBE5F0
+pub const LIGHT_REASONING_RGB: (u8, u8, u8) = (255, 246, 214); // #FFF6D6
+pub const LIGHT_SUCCESS_RGB: (u8, u8, u8) = (223, 247, 231); // #DFF7E7
+pub const LIGHT_ERROR_RGB: (u8, u8, u8) = (254, 229, 229); // #FEE5E5
+pub const LIGHT_TEXT_BODY_RGB: (u8, u8, u8) = (15, 23, 42); // #0F172A
+pub const LIGHT_TEXT_MUTED_RGB: (u8, u8, u8) = (51, 65, 85); // #334155
+pub const LIGHT_TEXT_HINT_RGB: (u8, u8, u8) = (100, 116, 139); // #64748B
+pub const LIGHT_TEXT_SOFT_RGB: (u8, u8, u8) = (30, 41, 59); // #1E293B
+pub const LIGHT_BORDER_RGB: (u8, u8, u8) = (139, 161, 184); // #8BA1B8
+pub const LIGHT_SELECTION_RGB: (u8, u8, u8) = (207, 224, 247); // #CFE0F7
+pub const GRAYSCALE_SURFACE_RGB: (u8, u8, u8) = (10, 10, 10); // #0A0A0A
+pub const GRAYSCALE_PANEL_RGB: (u8, u8, u8) = (18, 18, 18); // #121212
+pub const GRAYSCALE_ELEVATED_RGB: (u8, u8, u8) = (31, 31, 31); // #1F1F1F
+pub const GRAYSCALE_REASONING_RGB: (u8, u8, u8) = (38, 38, 38); // #262626
+pub const GRAYSCALE_SUCCESS_RGB: (u8, u8, u8) = (34, 34, 34); // #222222
+pub const GRAYSCALE_ERROR_RGB: (u8, u8, u8) = (42, 42, 42); // #2A2A2A
+pub const GRAYSCALE_TEXT_BODY_RGB: (u8, u8, u8) = (236, 236, 236); // #ECECEC
+pub const GRAYSCALE_TEXT_MUTED_RGB: (u8, u8, u8) = (180, 180, 180); // #B4B4B4
+pub const GRAYSCALE_TEXT_HINT_RGB: (u8, u8, u8) = (138, 138, 138); // #8A8A8A
+pub const GRAYSCALE_TEXT_SOFT_RGB: (u8, u8, u8) = (220, 220, 220); // #DCDCDC
+pub const GRAYSCALE_BORDER_RGB: (u8, u8, u8) = (96, 96, 96); // #606060
+pub const GRAYSCALE_SELECTION_RGB: (u8, u8, u8) = (62, 62, 62); // #3E3E3E
 
 // New semantic colors
-pub const BORDER_COLOR_RGB: (u8, u8, u8) = (42, 74, 127); // #2A4A7F
+pub const BORDER_COLOR_RGB: (u8, u8, u8) = WHALE_BORDER_RGB; // #2A4A7F
 
 pub const DEEPSEEK_BLUE: Color = Color::Rgb(
     DEEPSEEK_BLUE_RGB.0,
     DEEPSEEK_BLUE_RGB.1,
     DEEPSEEK_BLUE_RGB.2,
 );
+/// Now maps to the secondary accent (Seafoam) for backward compat.
 pub const DEEPSEEK_SKY: Color =
     Color::Rgb(DEEPSEEK_SKY_RGB.0, DEEPSEEK_SKY_RGB.1, DEEPSEEK_SKY_RGB.2);
 #[allow(dead_code)]
@@ -44,101 +114,1381 @@ pub const DEEPSEEK_SLATE: Color = Color::Rgb(
 pub const DEEPSEEK_RED: Color =
     Color::Rgb(DEEPSEEK_RED_RGB.0, DEEPSEEK_RED_RGB.1, DEEPSEEK_RED_RGB.2);
 
-pub const TEXT_BODY: Color = Color::White;
-pub const TEXT_SECONDARY: Color = Color::Rgb(192, 192, 192); // #C0C0C0
-pub const TEXT_HINT: Color = Color::Rgb(160, 160, 160); // #A0A0A0
-pub const TEXT_ACCENT: Color = DEEPSEEK_SKY;
-pub const SELECTION_TEXT: Color = Color::White;
-pub const TEXT_SOFT: Color = Color::Rgb(214, 223, 235); // #D6DFEB
+pub const LIGHT_SURFACE: Color = Color::Rgb(
+    LIGHT_SURFACE_RGB.0,
+    LIGHT_SURFACE_RGB.1,
+    LIGHT_SURFACE_RGB.2,
+);
+pub const LIGHT_PANEL: Color = Color::Rgb(LIGHT_PANEL_RGB.0, LIGHT_PANEL_RGB.1, LIGHT_PANEL_RGB.2);
+pub const LIGHT_ELEVATED: Color = Color::Rgb(
+    LIGHT_ELEVATED_RGB.0,
+    LIGHT_ELEVATED_RGB.1,
+    LIGHT_ELEVATED_RGB.2,
+);
+pub const LIGHT_REASONING: Color = Color::Rgb(
+    LIGHT_REASONING_RGB.0,
+    LIGHT_REASONING_RGB.1,
+    LIGHT_REASONING_RGB.2,
+);
+pub const LIGHT_SUCCESS: Color = Color::Rgb(
+    LIGHT_SUCCESS_RGB.0,
+    LIGHT_SUCCESS_RGB.1,
+    LIGHT_SUCCESS_RGB.2,
+);
+pub const LIGHT_ERROR: Color = Color::Rgb(LIGHT_ERROR_RGB.0, LIGHT_ERROR_RGB.1, LIGHT_ERROR_RGB.2);
+pub const LIGHT_TEXT_BODY: Color = Color::Rgb(
+    LIGHT_TEXT_BODY_RGB.0,
+    LIGHT_TEXT_BODY_RGB.1,
+    LIGHT_TEXT_BODY_RGB.2,
+);
+pub const LIGHT_TEXT_MUTED: Color = Color::Rgb(
+    LIGHT_TEXT_MUTED_RGB.0,
+    LIGHT_TEXT_MUTED_RGB.1,
+    LIGHT_TEXT_MUTED_RGB.2,
+);
+pub const LIGHT_TEXT_HINT: Color = Color::Rgb(
+    LIGHT_TEXT_HINT_RGB.0,
+    LIGHT_TEXT_HINT_RGB.1,
+    LIGHT_TEXT_HINT_RGB.2,
+);
+pub const LIGHT_TEXT_SOFT: Color = Color::Rgb(
+    LIGHT_TEXT_SOFT_RGB.0,
+    LIGHT_TEXT_SOFT_RGB.1,
+    LIGHT_TEXT_SOFT_RGB.2,
+);
+pub const LIGHT_BORDER: Color =
+    Color::Rgb(LIGHT_BORDER_RGB.0, LIGHT_BORDER_RGB.1, LIGHT_BORDER_RGB.2);
+pub const LIGHT_SELECTION_BG: Color = Color::Rgb(
+    LIGHT_SELECTION_RGB.0,
+    LIGHT_SELECTION_RGB.1,
+    LIGHT_SELECTION_RGB.2,
+);
+pub const GRAYSCALE_SURFACE: Color = Color::Rgb(
+    GRAYSCALE_SURFACE_RGB.0,
+    GRAYSCALE_SURFACE_RGB.1,
+    GRAYSCALE_SURFACE_RGB.2,
+);
+pub const GRAYSCALE_PANEL: Color = Color::Rgb(
+    GRAYSCALE_PANEL_RGB.0,
+    GRAYSCALE_PANEL_RGB.1,
+    GRAYSCALE_PANEL_RGB.2,
+);
+pub const GRAYSCALE_ELEVATED: Color = Color::Rgb(
+    GRAYSCALE_ELEVATED_RGB.0,
+    GRAYSCALE_ELEVATED_RGB.1,
+    GRAYSCALE_ELEVATED_RGB.2,
+);
+pub const GRAYSCALE_REASONING: Color = Color::Rgb(
+    GRAYSCALE_REASONING_RGB.0,
+    GRAYSCALE_REASONING_RGB.1,
+    GRAYSCALE_REASONING_RGB.2,
+);
+pub const GRAYSCALE_SUCCESS: Color = Color::Rgb(
+    GRAYSCALE_SUCCESS_RGB.0,
+    GRAYSCALE_SUCCESS_RGB.1,
+    GRAYSCALE_SUCCESS_RGB.2,
+);
+pub const GRAYSCALE_ERROR: Color = Color::Rgb(
+    GRAYSCALE_ERROR_RGB.0,
+    GRAYSCALE_ERROR_RGB.1,
+    GRAYSCALE_ERROR_RGB.2,
+);
+pub const GRAYSCALE_TEXT_BODY: Color = Color::Rgb(
+    GRAYSCALE_TEXT_BODY_RGB.0,
+    GRAYSCALE_TEXT_BODY_RGB.1,
+    GRAYSCALE_TEXT_BODY_RGB.2,
+);
+pub const GRAYSCALE_TEXT_MUTED: Color = Color::Rgb(
+    GRAYSCALE_TEXT_MUTED_RGB.0,
+    GRAYSCALE_TEXT_MUTED_RGB.1,
+    GRAYSCALE_TEXT_MUTED_RGB.2,
+);
+pub const GRAYSCALE_TEXT_HINT: Color = Color::Rgb(
+    GRAYSCALE_TEXT_HINT_RGB.0,
+    GRAYSCALE_TEXT_HINT_RGB.1,
+    GRAYSCALE_TEXT_HINT_RGB.2,
+);
+pub const GRAYSCALE_TEXT_SOFT: Color = Color::Rgb(
+    GRAYSCALE_TEXT_SOFT_RGB.0,
+    GRAYSCALE_TEXT_SOFT_RGB.1,
+    GRAYSCALE_TEXT_SOFT_RGB.2,
+);
+pub const GRAYSCALE_BORDER: Color = Color::Rgb(
+    GRAYSCALE_BORDER_RGB.0,
+    GRAYSCALE_BORDER_RGB.1,
+    GRAYSCALE_BORDER_RGB.2,
+);
+pub const GRAYSCALE_SELECTION_BG: Color = Color::Rgb(
+    GRAYSCALE_SELECTION_RGB.0,
+    GRAYSCALE_SELECTION_RGB.1,
+    GRAYSCALE_SELECTION_RGB.2,
+);
+
+pub const TEXT_BODY: Color = Color::Rgb(
+    WHALE_TEXT_BODY_RGB.0,
+    WHALE_TEXT_BODY_RGB.1,
+    WHALE_TEXT_BODY_RGB.2,
+);
+pub const TEXT_SECONDARY: Color = Color::Rgb(
+    WHALE_TEXT_MUTED_RGB.0,
+    WHALE_TEXT_MUTED_RGB.1,
+    WHALE_TEXT_MUTED_RGB.2,
+);
+pub const TEXT_HINT: Color = Color::Rgb(
+    WHALE_TEXT_HINT_RGB.0,
+    WHALE_TEXT_HINT_RGB.1,
+    WHALE_TEXT_HINT_RGB.2,
+);
+pub const TEXT_ACCENT: Color = Color::Rgb(
+    WHALE_ACCENT_SECONDARY_RGB.0,
+    WHALE_ACCENT_SECONDARY_RGB.1,
+    WHALE_ACCENT_SECONDARY_RGB.2,
+);
+pub const SELECTION_TEXT: Color = Color::Rgb(
+    WHALE_TEXT_BODY_RGB.0,
+    WHALE_TEXT_BODY_RGB.1,
+    WHALE_TEXT_BODY_RGB.2,
+); // Ivory — softer than pure white
+pub const TEXT_SOFT: Color = Color::Rgb(
+    WHALE_TEXT_SOFT_RGB.0,
+    WHALE_TEXT_SOFT_RGB.1,
+    WHALE_TEXT_SOFT_RGB.2,
+);
+pub const TEXT_REASONING: Color = Color::Rgb(
+    WHALE_REASONING_TEXT_RGB.0,
+    WHALE_REASONING_TEXT_RGB.1,
+    WHALE_REASONING_TEXT_RGB.2,
+);
 
 // Compatibility aliases for existing call sites.
 pub const TEXT_PRIMARY: Color = TEXT_BODY;
 pub const TEXT_MUTED: Color = TEXT_SECONDARY;
 pub const TEXT_DIM: Color = TEXT_HINT;
+pub const USER_BODY: Color = Color::Rgb(74, 222, 128); // #4ADE80 green
+pub const LIGHT_USER_BODY: Color = Color::Rgb(21, 128, 61); // #15803D green
 
 // New semantic colors for UI theming
 pub const BORDER_COLOR: Color =
     Color::Rgb(BORDER_COLOR_RGB.0, BORDER_COLOR_RGB.1, BORDER_COLOR_RGB.2);
 #[allow(dead_code)]
-pub const ACCENT_PRIMARY: Color = DEEPSEEK_BLUE; // #3578E5
+pub const ACCENT_PRIMARY: Color = Color::Rgb(
+    WHALE_ACCENT_PRIMARY_RGB.0,
+    WHALE_ACCENT_PRIMARY_RGB.1,
+    WHALE_ACCENT_PRIMARY_RGB.2,
+);
 #[allow(dead_code)]
-pub const ACCENT_SECONDARY: Color = TEXT_ACCENT; // #6AAEF2
+pub const ACCENT_SECONDARY: Color = Color::Rgb(
+    WHALE_ACCENT_SECONDARY_RGB.0,
+    WHALE_ACCENT_SECONDARY_RGB.1,
+    WHALE_ACCENT_SECONDARY_RGB.2,
+);
 #[allow(dead_code)]
-pub const BACKGROUND_DARK: Color = Color::Rgb(13, 26, 48); // #0D1A30
+pub const BACKGROUND_DARK: Color = Color::Rgb(WHALE_BG_RGB.0, WHALE_BG_RGB.1, WHALE_BG_RGB.2);
 #[allow(dead_code)]
-pub const STATUS_NEUTRAL: Color = Color::Rgb(160, 160, 160); // #A0A0A0
+pub const STATUS_NEUTRAL: Color = TEXT_MUTED;
 #[allow(dead_code)]
-pub const SURFACE_PANEL: Color = Color::Rgb(21, 33, 52); // #152134
+pub const SURFACE_PANEL: Color =
+    Color::Rgb(WHALE_PANEL_RGB.0, WHALE_PANEL_RGB.1, WHALE_PANEL_RGB.2);
 #[allow(dead_code)]
-pub const SURFACE_ELEVATED: Color = Color::Rgb(28, 42, 64); // #1C2A40
-pub const SURFACE_REASONING: Color = Color::Rgb(54, 44, 26); // #362C1A
+pub const SURFACE_ELEVATED: Color = Color::Rgb(
+    WHALE_ELEVATED_RGB.0,
+    WHALE_ELEVATED_RGB.1,
+    WHALE_ELEVATED_RGB.2,
+);
+pub const SURFACE_REASONING: Color = Color::Rgb(
+    WHALE_REASONING_SURFACE_RGB.0,
+    WHALE_REASONING_SURFACE_RGB.1,
+    WHALE_REASONING_SURFACE_RGB.2,
+);
+pub const SURFACE_REASONING_TINT: Color = Color::Rgb(
+    WHALE_REASONING_TINT_RGB.0,
+    WHALE_REASONING_TINT_RGB.1,
+    WHALE_REASONING_TINT_RGB.2,
+);
 #[allow(dead_code)]
-pub const SURFACE_REASONING_ACTIVE: Color = Color::Rgb(68, 53, 28); // #44351C
+pub const SURFACE_REASONING_ACTIVE: Color = Color::Rgb(58, 46, 32);
 #[allow(dead_code)]
-pub const SURFACE_TOOL: Color = Color::Rgb(24, 39, 60); // #18273C
+pub const SURFACE_TOOL: Color = Color::Rgb(
+    WHALE_TOOL_SURFACE_RGB.0,
+    WHALE_TOOL_SURFACE_RGB.1,
+    WHALE_TOOL_SURFACE_RGB.2,
+);
 #[allow(dead_code)]
-pub const SURFACE_TOOL_ACTIVE: Color = Color::Rgb(29, 48, 73); // #1D3049
+pub const SURFACE_TOOL_ACTIVE: Color = Color::Rgb(
+    WHALE_TOOL_ACTIVE_RGB.0,
+    WHALE_TOOL_ACTIVE_RGB.1,
+    WHALE_TOOL_ACTIVE_RGB.2,
+);
 #[allow(dead_code)]
-pub const SURFACE_SUCCESS: Color = Color::Rgb(22, 56, 63); // #16383F
+pub const SURFACE_SUCCESS: Color = Color::Rgb(18, 42, 37); // dark teal tint
 #[allow(dead_code)]
-pub const SURFACE_ERROR: Color = Color::Rgb(63, 27, 36); // #3F1B24
-pub const ACCENT_REASONING_LIVE: Color = Color::Rgb(146, 198, 248); // #92C6F8
-pub const ACCENT_TOOL_LIVE: Color = Color::Rgb(133, 184, 234); // #85B8EA
-pub const ACCENT_TOOL_ISSUE: Color = Color::Rgb(192, 143, 153); // #C08F99
-pub const TEXT_TOOL_OUTPUT: Color = Color::Rgb(205, 216, 228); // #CDD8E4
+pub const SURFACE_ERROR: Color = Color::Rgb(
+    WHALE_ERROR_SURFACE_RGB.0,
+    WHALE_ERROR_SURFACE_RGB.1,
+    WHALE_ERROR_SURFACE_RGB.2,
+);
+pub const DIFF_ADDED_BG: Color = Color::Rgb(
+    WHALE_DIFF_ADDED_BG_RGB.0,
+    WHALE_DIFF_ADDED_BG_RGB.1,
+    WHALE_DIFF_ADDED_BG_RGB.2,
+);
+pub const DIFF_DELETED_BG: Color = Color::Rgb(
+    WHALE_DIFF_DELETED_BG_RGB.0,
+    WHALE_DIFF_DELETED_BG_RGB.1,
+    WHALE_DIFF_DELETED_BG_RGB.2,
+);
+pub const DIFF_ADDED: Color = Color::Rgb(
+    WHALE_DIFF_ADDED_RGB.0,
+    WHALE_DIFF_ADDED_RGB.1,
+    WHALE_DIFF_ADDED_RGB.2,
+);
+pub const ACCENT_REASONING_LIVE: Color = Color::Rgb(
+    WHALE_REASONING_TEXT_RGB.0,
+    WHALE_REASONING_TEXT_RGB.1,
+    WHALE_REASONING_TEXT_RGB.2,
+);
+pub const ACCENT_TOOL_LIVE: Color = Color::Rgb(
+    WHALE_TOOL_LIVE_RGB.0,
+    WHALE_TOOL_LIVE_RGB.1,
+    WHALE_TOOL_LIVE_RGB.2,
+);
+pub const ACCENT_TOOL_ISSUE: Color = Color::Rgb(
+    WHALE_TOOL_ISSUE_RGB.0,
+    WHALE_TOOL_ISSUE_RGB.1,
+    WHALE_TOOL_ISSUE_RGB.2,
+);
+pub const TEXT_TOOL_OUTPUT: Color = Color::Rgb(
+    WHALE_TOOL_OUTPUT_RGB.0,
+    WHALE_TOOL_OUTPUT_RGB.1,
+    WHALE_TOOL_OUTPUT_RGB.2,
+);
 
 // Legacy status colors - keep for backward compatibility
-pub const STATUS_SUCCESS: Color = DEEPSEEK_SKY;
-pub const STATUS_WARNING: Color = Color::Rgb(255, 170, 60); // Amber
-pub const STATUS_ERROR: Color = DEEPSEEK_RED;
+pub const STATUS_SUCCESS: Color = Color::Rgb(
+    WHALE_SUCCESS_RGB.0,
+    WHALE_SUCCESS_RGB.1,
+    WHALE_SUCCESS_RGB.2,
+);
+pub const STATUS_WARNING: Color = Color::Rgb(
+    WHALE_WARNING_RGB.0,
+    WHALE_WARNING_RGB.1,
+    WHALE_WARNING_RGB.2,
+);
+pub const STATUS_ERROR: Color = Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2);
 #[allow(dead_code)]
-pub const STATUS_INFO: Color = DEEPSEEK_BLUE;
+pub const STATUS_INFO: Color = Color::Rgb(WHALE_INFO_RGB.0, WHALE_INFO_RGB.1, WHALE_INFO_RGB.2);
 
 // Mode-specific accent colors for mode badges
-pub const MODE_AGENT: Color = Color::Rgb(80, 150, 255); // Bright blue
-pub const MODE_YOLO: Color = Color::Rgb(255, 100, 100); // Warning red
-pub const MODE_PLAN: Color = Color::Rgb(255, 170, 60); // Orange
+pub const MODE_AGENT: Color = Color::Rgb(
+    WHALE_MODE_AGENT_RGB.0,
+    WHALE_MODE_AGENT_RGB.1,
+    WHALE_MODE_AGENT_RGB.2,
+);
+pub const MODE_YOLO: Color = Color::Rgb(
+    WHALE_MODE_YOLO_RGB.0,
+    WHALE_MODE_YOLO_RGB.1,
+    WHALE_MODE_YOLO_RGB.2,
+);
+pub const MODE_PLAN: Color = Color::Rgb(
+    WHALE_MODE_PLAN_RGB.0,
+    WHALE_MODE_PLAN_RGB.1,
+    WHALE_MODE_PLAN_RGB.2,
+);
+pub const MODE_GOAL: Color = Color::Rgb(
+    WHALE_MODE_GOAL_RGB.0,
+    WHALE_MODE_GOAL_RGB.1,
+    WHALE_MODE_GOAL_RGB.2,
+);
 
-pub const SELECTION_BG: Color = Color::Rgb(26, 44, 74);
+pub const SELECTION_BG: Color = Color::Rgb(
+    WHALE_SELECTION_RGB.0,
+    WHALE_SELECTION_RGB.1,
+    WHALE_SELECTION_RGB.2,
+);
 #[allow(dead_code)]
 pub const COMPOSER_BG: Color = DEEPSEEK_SLATE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteMode {
+    Dark,
+    Light,
+    Grayscale,
+}
+
+impl PaletteMode {
+    /// Parse `COLORFGBG`, whose last numeric segment is the terminal
+    /// background color. Values >= 8 conventionally indicate a light profile.
+    #[must_use]
+    pub fn from_colorfgbg(value: &str) -> Option<Self> {
+        let bg = value
+            .split(';')
+            .rev()
+            .find_map(|part| part.parse::<u16>().ok())?;
+        Some(if bg >= 8 { Self::Light } else { Self::Dark })
+    }
+
+    /// Detect the active palette mode. `COLORFGBG` wins when present; macOS
+    /// appearance is a fallback for terminals that omit terminal color hints.
+    /// Missing or unparsable values default to dark so existing terminal setups
+    /// keep the tuned theme.
+    #[must_use]
+    pub fn detect() -> Self {
+        Self::detect_from_sources(
+            std::env::var("COLORFGBG").ok().as_deref(),
+            detect_macos_palette_mode(),
+        )
+    }
+
+    #[must_use]
+    fn detect_from_sources(colorfgbg: Option<&str>, macos_fallback: Option<Self>) -> Self {
+        colorfgbg
+            .and_then(Self::from_colorfgbg)
+            .or(macos_fallback)
+            .unwrap_or(Self::Dark)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_palette_mode() -> Option<PaletteMode> {
+    let output = Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        Some(palette_mode_from_apple_interface_style(
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    } else {
+        Some(PaletteMode::Light)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_macos_palette_mode() -> Option<PaletteMode> {
+    None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn palette_mode_from_apple_interface_style(value: &str) -> PaletteMode {
+    if value.trim().eq_ignore_ascii_case("dark") {
+        PaletteMode::Dark
+    } else {
+        PaletteMode::Light
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiTheme {
     pub name: &'static str,
+    pub mode: PaletteMode,
+    // Surface hierarchy
+    pub surface_bg: Color,
+    pub panel_bg: Color,
+    pub elevated_bg: Color,
     pub composer_bg: Color,
     pub selection_bg: Color,
     pub header_bg: Color,
-    /// Statusline mode colors (agent/yolo/plan)
-    pub mode_agent: Color,
-    pub mode_yolo: Color,
-    pub mode_plan: Color,
-    /// Statusline status colors
-    pub status_ready: Color,
-    pub status_working: Color,
-    pub status_warning: Color,
-    /// Statusline text colors
+    pub footer_bg: Color,
+    /// Text hierarchy
     pub text_dim: Color,
     pub text_hint: Color,
     pub text_muted: Color,
+    pub text_body: Color,
+    pub text_soft: Color,
+    pub border: Color,
+    // Accent roles
+    pub accent_primary: Color,
+    pub accent_secondary: Color,
+    pub accent_action: Color,
+    // Error / destructive
+    pub error_fg: Color,
+    pub error_hover: Color,
+    pub error_surface: Color,
+    pub error_border: Color,
+    pub error_text: Color,
+    // Status roles (warning / success / info)
+    pub warning: Color,
+    pub success: Color,
+    pub info: Color,
+    // Mode badge colors (agent/yolo/plan/goal)
+    pub mode_agent: Color,
+    pub mode_yolo: Color,
+    pub mode_plan: Color,
+    pub mode_goal: Color,
+    // Footer statusline colors
+    pub status_ready: Color,
+    pub status_working: Color,
+    pub status_warning: Color,
+    // Diff colors
+    pub diff_added_fg: Color,
+    pub diff_deleted_fg: Color,
+    pub diff_added_bg: Color,
+    pub diff_deleted_bg: Color,
+    // Tool cell colors
+    pub tool_running: Color,
+    pub tool_success: Color,
+    pub tool_failed: Color,
 }
 
 pub const UI_THEME: UiTheme = UiTheme {
     name: "whale",
+    mode: PaletteMode::Dark,
+    surface_bg: DEEPSEEK_INK,
+    panel_bg: DEEPSEEK_SLATE,
+    elevated_bg: SURFACE_ELEVATED,
     composer_bg: DEEPSEEK_SLATE,
     selection_bg: SELECTION_BG,
     header_bg: DEEPSEEK_INK,
-    mode_agent: MODE_AGENT,
-    mode_yolo: MODE_YOLO,
-    mode_plan: MODE_PLAN,
-    status_ready: TEXT_MUTED,
-    status_working: DEEPSEEK_SKY,
-    status_warning: STATUS_WARNING,
+    footer_bg: DEEPSEEK_INK,
     text_dim: TEXT_DIM,
     text_hint: TEXT_HINT,
     text_muted: TEXT_MUTED,
+    text_body: TEXT_BODY,
+    text_soft: TEXT_SOFT,
+    border: BORDER_COLOR,
+    accent_primary: Color::Rgb(
+        WHALE_ACCENT_PRIMARY_RGB.0,
+        WHALE_ACCENT_PRIMARY_RGB.1,
+        WHALE_ACCENT_PRIMARY_RGB.2,
+    ),
+    accent_secondary: Color::Rgb(
+        WHALE_ACCENT_SECONDARY_RGB.0,
+        WHALE_ACCENT_SECONDARY_RGB.1,
+        WHALE_ACCENT_SECONDARY_RGB.2,
+    ),
+    accent_action: Color::Rgb(
+        WHALE_ACCENT_ACTION_RGB.0,
+        WHALE_ACCENT_ACTION_RGB.1,
+        WHALE_ACCENT_ACTION_RGB.2,
+    ),
+    error_fg: Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2),
+    error_hover: Color::Rgb(
+        WHALE_ERROR_HOVER_RGB.0,
+        WHALE_ERROR_HOVER_RGB.1,
+        WHALE_ERROR_HOVER_RGB.2,
+    ),
+    error_surface: Color::Rgb(
+        WHALE_ERROR_SURFACE_RGB.0,
+        WHALE_ERROR_SURFACE_RGB.1,
+        WHALE_ERROR_SURFACE_RGB.2,
+    ),
+    error_border: Color::Rgb(
+        WHALE_ERROR_BORDER_RGB.0,
+        WHALE_ERROR_BORDER_RGB.1,
+        WHALE_ERROR_BORDER_RGB.2,
+    ),
+    error_text: Color::Rgb(
+        WHALE_ERROR_TEXT_RGB.0,
+        WHALE_ERROR_TEXT_RGB.1,
+        WHALE_ERROR_TEXT_RGB.2,
+    ),
+    warning: Color::Rgb(
+        WHALE_WARNING_RGB.0,
+        WHALE_WARNING_RGB.1,
+        WHALE_WARNING_RGB.2,
+    ),
+    success: Color::Rgb(
+        WHALE_SUCCESS_RGB.0,
+        WHALE_SUCCESS_RGB.1,
+        WHALE_SUCCESS_RGB.2,
+    ),
+    info: Color::Rgb(WHALE_INFO_RGB.0, WHALE_INFO_RGB.1, WHALE_INFO_RGB.2),
+    mode_agent: MODE_AGENT,
+    mode_yolo: MODE_YOLO,
+    mode_plan: MODE_PLAN,
+    mode_goal: MODE_GOAL,
+    status_ready: TEXT_MUTED,
+    status_working: DEEPSEEK_SKY,
+    status_warning: STATUS_WARNING,
+    diff_added_fg: DIFF_ADDED,
+    diff_deleted_fg: Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2),
+    diff_added_bg: DIFF_ADDED_BG,
+    diff_deleted_bg: DIFF_DELETED_BG,
+    tool_running: ACCENT_TOOL_LIVE,
+    tool_success: TEXT_DIM,
+    tool_failed: ACCENT_TOOL_ISSUE,
 };
 
+pub const LIGHT_UI_THEME: UiTheme = UiTheme {
+    name: "whale-light",
+    mode: PaletteMode::Light,
+    surface_bg: LIGHT_SURFACE,
+    panel_bg: LIGHT_PANEL,
+    elevated_bg: LIGHT_ELEVATED,
+    composer_bg: LIGHT_PANEL,
+    selection_bg: LIGHT_SELECTION_BG,
+    header_bg: LIGHT_SURFACE,
+    footer_bg: LIGHT_SURFACE,
+    text_dim: LIGHT_TEXT_HINT,
+    text_hint: LIGHT_TEXT_HINT,
+    text_muted: LIGHT_TEXT_MUTED,
+    text_body: LIGHT_TEXT_BODY,
+    text_soft: LIGHT_TEXT_SOFT,
+    border: LIGHT_BORDER,
+    accent_primary: Color::Rgb(53, 120, 229),   // blue
+    accent_secondary: Color::Rgb(79, 180, 160), // teal
+    accent_action: Color::Rgb(220, 90, 60),     // warm coral
+    error_fg: Color::Rgb(200, 40, 60),          // red
+    error_hover: Color::Rgb(220, 70, 85),
+    error_surface: Color::Rgb(254, 229, 229),
+    error_border: Color::Rgb(240, 120, 130),
+    error_text: Color::Rgb(120, 20, 30),
+    warning: Color::Rgb(180, 83, 9),      // amber
+    success: Color::Rgb(21, 128, 61),     // green
+    info: Color::Rgb(53, 120, 229),       // blue
+    mode_agent: Color::Rgb(53, 120, 229), // blue
+    mode_yolo: Color::Rgb(200, 40, 60),   // red
+    mode_plan: Color::Rgb(180, 83, 9),    // amber
+    mode_goal: Color::Rgb(80, 180, 130),  // mint green
+    status_ready: LIGHT_TEXT_MUTED,
+    status_working: Color::Rgb(53, 120, 229),   // blue
+    status_warning: Color::Rgb(180, 83, 9),     // amber
+    diff_added_fg: Color::Rgb(22, 101, 52),     // green
+    diff_deleted_fg: Color::Rgb(200, 40, 60),   // red
+    diff_added_bg: Color::Rgb(223, 247, 231),   // light green
+    diff_deleted_bg: Color::Rgb(254, 229, 229), // light red
+    tool_running: Color::Rgb(53, 120, 229),     // blue
+    tool_success: LIGHT_TEXT_HINT,
+    tool_failed: Color::Rgb(200, 40, 60), // red
+};
+
+pub const GRAYSCALE_UI_THEME: UiTheme = UiTheme {
+    name: "grayscale",
+    mode: PaletteMode::Grayscale,
+    surface_bg: GRAYSCALE_SURFACE,
+    panel_bg: GRAYSCALE_PANEL,
+    elevated_bg: GRAYSCALE_ELEVATED,
+    composer_bg: GRAYSCALE_PANEL,
+    selection_bg: GRAYSCALE_SELECTION_BG,
+    header_bg: GRAYSCALE_SURFACE,
+    footer_bg: GRAYSCALE_SURFACE,
+    text_dim: GRAYSCALE_TEXT_HINT,
+    text_hint: GRAYSCALE_TEXT_HINT,
+    text_muted: GRAYSCALE_TEXT_MUTED,
+    text_body: GRAYSCALE_TEXT_BODY,
+    text_soft: GRAYSCALE_TEXT_SOFT,
+    border: GRAYSCALE_BORDER,
+    accent_primary: GRAYSCALE_TEXT_SOFT,
+    accent_secondary: GRAYSCALE_TEXT_MUTED,
+    accent_action: Color::Rgb(210, 210, 210),
+    error_fg: GRAYSCALE_TEXT_BODY,
+    error_hover: GRAYSCALE_TEXT_SOFT,
+    error_surface: GRAYSCALE_ERROR,
+    error_border: GRAYSCALE_BORDER,
+    error_text: GRAYSCALE_TEXT_SOFT,
+    warning: GRAYSCALE_TEXT_MUTED,
+    success: GRAYSCALE_TEXT_SOFT,
+    info: GRAYSCALE_TEXT_MUTED,
+    mode_agent: Color::Rgb(200, 200, 200),
+    mode_yolo: GRAYSCALE_TEXT_BODY,
+    mode_plan: GRAYSCALE_TEXT_MUTED,
+    mode_goal: GRAYSCALE_TEXT_SOFT,
+    status_ready: GRAYSCALE_TEXT_MUTED,
+    status_working: GRAYSCALE_TEXT_SOFT,
+    status_warning: GRAYSCALE_TEXT_BODY,
+    diff_added_fg: GRAYSCALE_TEXT_SOFT,
+    diff_deleted_fg: GRAYSCALE_TEXT_BODY,
+    diff_added_bg: GRAYSCALE_SUCCESS,
+    diff_deleted_bg: GRAYSCALE_ERROR,
+    tool_running: GRAYSCALE_TEXT_SOFT,
+    tool_success: GRAYSCALE_TEXT_HINT,
+    tool_failed: GRAYSCALE_TEXT_BODY,
+};
+
+pub const CATPPUCCIN_MOCHA_UI_THEME: UiTheme = UiTheme {
+    name: "catppuccin-mocha",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x1e, 0x1e, 0x2e),  // base
+    panel_bg: Color::Rgb(0x18, 0x18, 0x25),    // mantle
+    elevated_bg: Color::Rgb(0x31, 0x32, 0x44), // surface0
+    composer_bg: Color::Rgb(0x18, 0x18, 0x25),
+    selection_bg: Color::Rgb(0x45, 0x47, 0x5a), // surface1
+    header_bg: Color::Rgb(0x11, 0x11, 0x1b),    // crust
+    footer_bg: Color::Rgb(0x11, 0x11, 0x1b),
+    text_dim: Color::Rgb(0x6c, 0x70, 0x86),         // overlay0
+    text_hint: Color::Rgb(0x7f, 0x84, 0x9c),        // overlay1
+    text_muted: Color::Rgb(0xa6, 0xad, 0xc8),       // subtext0
+    text_body: Color::Rgb(0xcd, 0xd6, 0xf4),        // text
+    text_soft: Color::Rgb(0xba, 0xc2, 0xde),        // subtext1
+    border: Color::Rgb(0x45, 0x47, 0x5a),           // surface1
+    accent_primary: Color::Rgb(0x89, 0xb4, 0xfa),   // blue
+    accent_secondary: Color::Rgb(0x74, 0xc7, 0xec), // sapphire
+    accent_action: Color::Rgb(0xfa, 0xb3, 0x87),    // peach
+    error_fg: Color::Rgb(0xf3, 0x8b, 0xa8),         // red
+    error_hover: Color::Rgb(0xf5, 0xa2, 0xbc),
+    error_surface: Color::Rgb(0x3a, 0x1f, 0x2a),
+    error_border: Color::Rgb(0xf3, 0x8b, 0xa8),
+    error_text: Color::Rgb(0xf5, 0xc2, 0xd0),
+    warning: Color::Rgb(0xf9, 0xe2, 0xaf),         // yellow
+    success: Color::Rgb(0xa6, 0xe3, 0xa1),         // green
+    info: Color::Rgb(0x89, 0xd9, 0xeb),            // sky
+    mode_agent: Color::Rgb(0x89, 0xb4, 0xfa),      // blue
+    mode_yolo: Color::Rgb(0xf3, 0x8b, 0xa8),       // red
+    mode_plan: Color::Rgb(0xfa, 0xb3, 0x87),       // peach
+    mode_goal: Color::Rgb(0xa6, 0xe3, 0xa1),       // green
+    status_ready: Color::Rgb(0x7f, 0x84, 0x9c),    // overlay1
+    status_working: Color::Rgb(0x74, 0xc7, 0xec),  // sapphire
+    status_warning: Color::Rgb(0xf9, 0xe2, 0xaf),  // yellow
+    diff_added_fg: Color::Rgb(0xa6, 0xe3, 0xa1),   // green
+    diff_deleted_fg: Color::Rgb(0xf3, 0x8b, 0xa8), // red
+    diff_added_bg: Color::Rgb(0x1f, 0x33, 0x29),
+    diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x2a),
+    tool_running: Color::Rgb(0x74, 0xc7, 0xec), // sapphire
+    tool_success: Color::Rgb(0x7f, 0x84, 0x9c), // overlay1
+    tool_failed: Color::Rgb(0xf3, 0x8b, 0xa8),  // red
+};
+
+pub const TOKYO_NIGHT_UI_THEME: UiTheme = UiTheme {
+    name: "tokyo-night",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x1a, 0x1b, 0x26),  // bg
+    panel_bg: Color::Rgb(0x16, 0x16, 0x1e),    // bg_dark
+    elevated_bg: Color::Rgb(0x29, 0x2e, 0x42), // bg_highlight
+    composer_bg: Color::Rgb(0x16, 0x16, 0x1e),
+    selection_bg: Color::Rgb(0x28, 0x34, 0x57), // visual selection
+    header_bg: Color::Rgb(0x16, 0x16, 0x1e),
+    footer_bg: Color::Rgb(0x16, 0x16, 0x1e),
+    text_dim: Color::Rgb(0x56, 0x5f, 0x89),   // comment
+    text_hint: Color::Rgb(0x73, 0x7a, 0xa2),  // dark5
+    text_muted: Color::Rgb(0xa9, 0xb1, 0xd6), // fg_dark
+    text_body: Color::Rgb(0xc0, 0xca, 0xf5),  // fg
+    text_soft: Color::Rgb(0xbb, 0xc2, 0xe0),
+    border: Color::Rgb(0x41, 0x48, 0x68), // terminal_black
+    accent_primary: Color::Rgb(0x7a, 0xa2, 0xf7), // blue
+    accent_secondary: Color::Rgb(0x7d, 0xcf, 0xff), // cyan
+    accent_action: Color::Rgb(0xff, 0x9e, 0x64), // orange
+    error_fg: Color::Rgb(0xf7, 0x76, 0x8e), // red
+    error_hover: Color::Rgb(0xf9, 0x92, 0xa4),
+    error_surface: Color::Rgb(0x33, 0x1c, 0x24),
+    error_border: Color::Rgb(0xf7, 0x76, 0x8e),
+    error_text: Color::Rgb(0xfa, 0xcc, 0xd4),
+    warning: Color::Rgb(0xe0, 0xaf, 0x68),         // yellow
+    success: Color::Rgb(0x9e, 0xce, 0x6a),         // green
+    info: Color::Rgb(0x7d, 0xcf, 0xff),            // cyan
+    mode_agent: Color::Rgb(0x7a, 0xa2, 0xf7),      // blue
+    mode_yolo: Color::Rgb(0xf7, 0x76, 0x8e),       // red
+    mode_plan: Color::Rgb(0xff, 0x9e, 0x64),       // orange
+    mode_goal: Color::Rgb(0x9e, 0xce, 0x6a),       // green
+    status_ready: Color::Rgb(0x56, 0x5f, 0x89),    // comment
+    status_working: Color::Rgb(0x7d, 0xcf, 0xff),  // cyan
+    status_warning: Color::Rgb(0xe0, 0xaf, 0x68),  // yellow
+    diff_added_fg: Color::Rgb(0x9e, 0xce, 0x6a),   // green
+    diff_deleted_fg: Color::Rgb(0xf7, 0x76, 0x8e), // red
+    diff_added_bg: Color::Rgb(0x1b, 0x2b, 0x1f),
+    diff_deleted_bg: Color::Rgb(0x33, 0x1c, 0x24),
+    tool_running: Color::Rgb(0x7d, 0xcf, 0xff), // cyan
+    tool_success: Color::Rgb(0x56, 0x5f, 0x89), // comment
+    tool_failed: Color::Rgb(0xf7, 0x76, 0x8e),  // red
+};
+
+pub const DRACULA_UI_THEME: UiTheme = UiTheme {
+    name: "dracula",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x28, 0x2a, 0x36), // background
+    panel_bg: Color::Rgb(0x21, 0x22, 0x2c),
+    elevated_bg: Color::Rgb(0x34, 0x37, 0x46),
+    composer_bg: Color::Rgb(0x21, 0x22, 0x2c),
+    selection_bg: Color::Rgb(0x44, 0x47, 0x5a), // current line
+    header_bg: Color::Rgb(0x21, 0x22, 0x2c),
+    footer_bg: Color::Rgb(0x21, 0x22, 0x2c),
+    text_dim: Color::Rgb(0x62, 0x72, 0xa4), // comment
+    text_hint: Color::Rgb(0x8a, 0x8e, 0xaa),
+    text_muted: Color::Rgb(0xc0, 0xc4, 0xd6),
+    text_body: Color::Rgb(0xf8, 0xf8, 0xf2), // foreground
+    text_soft: Color::Rgb(0xe2, 0xe2, 0xdc),
+    border: Color::Rgb(0x44, 0x47, 0x5a),
+    accent_primary: Color::Rgb(0xbd, 0x93, 0xf9), // purple
+    accent_secondary: Color::Rgb(0x8b, 0xe9, 0xfd), // cyan
+    accent_action: Color::Rgb(0xff, 0xb8, 0x6c),  // orange
+    error_fg: Color::Rgb(0xff, 0x55, 0x55),       // red
+    error_hover: Color::Rgb(0xff, 0x7c, 0x7c),
+    error_surface: Color::Rgb(0x3a, 0x1f, 0x22),
+    error_border: Color::Rgb(0xff, 0x55, 0x55),
+    error_text: Color::Rgb(0xff, 0xbb, 0xbb),
+    warning: Color::Rgb(0xf1, 0xfa, 0x8c),         // yellow
+    success: Color::Rgb(0x50, 0xfa, 0x7b),         // green
+    info: Color::Rgb(0x8b, 0xe9, 0xfd),            // cyan
+    mode_agent: Color::Rgb(0xbd, 0x93, 0xf9),      // purple
+    mode_yolo: Color::Rgb(0xff, 0x55, 0x55),       // red
+    mode_plan: Color::Rgb(0xff, 0xb8, 0x6c),       // orange
+    mode_goal: Color::Rgb(0x50, 0xfa, 0x7b),       // green
+    status_ready: Color::Rgb(0x62, 0x72, 0xa4),    // comment
+    status_working: Color::Rgb(0x8b, 0xe9, 0xfd),  // cyan
+    status_warning: Color::Rgb(0xf1, 0xfa, 0x8c),  // yellow
+    diff_added_fg: Color::Rgb(0x50, 0xfa, 0x7b),   // green
+    diff_deleted_fg: Color::Rgb(0xff, 0x55, 0x55), // red
+    diff_added_bg: Color::Rgb(0x21, 0x3a, 0x2a),
+    diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x22),
+    tool_running: Color::Rgb(0x8b, 0xe9, 0xfd), // cyan
+    tool_success: Color::Rgb(0x62, 0x72, 0xa4), // comment
+    tool_failed: Color::Rgb(0xff, 0x55, 0x55),  // red
+};
+
+/// "Terminal" theme: lets the host terminal's color scheme show through
+/// instead of painting any RGB surface. Backgrounds use `Color::Reset`
+/// (the terminal's own default bg) and most text uses `Color::Reset`
+/// (terminal's own default fg). Accents are ANSI named colors so they
+/// also inherit the user's terminal palette (Solarized, Nord, custom
+/// schemes, etc.) rather than DeepSeek brand RGB.
+pub const TERMINAL_UI_THEME: UiTheme = UiTheme {
+    name: "terminal",
+    // Mode is reported as Dark to avoid the dark→light cell remap kicking
+    // in; the terminal-theme cell remap already normalizes everything to
+    // `Color::Reset`, and we never want a second pass overwriting that.
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Reset,
+    panel_bg: Color::Reset,
+    elevated_bg: Color::Reset,
+    composer_bg: Color::Reset,
+    selection_bg: Color::Reset,
+    header_bg: Color::Reset,
+    footer_bg: Color::Reset,
+    text_dim: Color::Reset,
+    text_hint: Color::Reset,
+    text_muted: Color::Reset,
+    text_body: Color::Reset,
+    text_soft: Color::Reset,
+    border: Color::Reset,
+    accent_primary: Color::Blue,
+    accent_secondary: Color::Cyan,
+    accent_action: Color::Yellow,
+    error_fg: Color::Red,
+    error_hover: Color::Red,
+    error_surface: Color::Reset,
+    error_border: Color::Red,
+    error_text: Color::Red,
+    warning: Color::Yellow,
+    success: Color::Green,
+    info: Color::Cyan,
+    mode_agent: Color::Blue,
+    mode_yolo: Color::Red,
+    // Magenta keeps Plan visually distinct from `status_warning` (yellow)
+    // so the mode indicator and warning chip don't collide on themes that
+    // render both in the status row.
+    mode_plan: Color::Magenta,
+    mode_goal: Color::Green,
+    // DarkGray gives "Ready" a low-contrast but still distinguishable hue
+    // versus default body text (which is `Color::Reset` on this theme).
+    status_ready: Color::DarkGray,
+    status_working: Color::Cyan,
+    status_warning: Color::Yellow,
+    diff_added_fg: Color::Green,
+    diff_deleted_fg: Color::Red,
+    diff_added_bg: Color::Reset,
+    diff_deleted_bg: Color::Reset,
+    tool_running: Color::Cyan,
+    tool_success: Color::Green,
+    tool_failed: Color::Red,
+};
+
+pub const GRUVBOX_DARK_UI_THEME: UiTheme = UiTheme {
+    name: "gruvbox-dark",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x28, 0x28, 0x28),  // bg0
+    panel_bg: Color::Rgb(0x3c, 0x38, 0x36),    // bg1
+    elevated_bg: Color::Rgb(0x50, 0x49, 0x45), // bg2
+    composer_bg: Color::Rgb(0x3c, 0x38, 0x36),
+    selection_bg: Color::Rgb(0x66, 0x5c, 0x54), // bg3
+    header_bg: Color::Rgb(0x1d, 0x20, 0x21),    // bg0_h
+    footer_bg: Color::Rgb(0x1d, 0x20, 0x21),
+    text_dim: Color::Rgb(0x92, 0x83, 0x74),         // gray
+    text_hint: Color::Rgb(0xa8, 0x99, 0x84),        // fg4
+    text_muted: Color::Rgb(0xbd, 0xae, 0x93),       // fg3
+    text_body: Color::Rgb(0xeb, 0xdb, 0xb2),        // fg1
+    text_soft: Color::Rgb(0xd5, 0xc4, 0xa1),        // fg2
+    border: Color::Rgb(0x66, 0x5c, 0x54),           // bg3
+    accent_primary: Color::Rgb(0x83, 0xa5, 0x98),   // blue
+    accent_secondary: Color::Rgb(0x8e, 0xc0, 0x7c), // aqua/green
+    accent_action: Color::Rgb(0xfe, 0x80, 0x19),    // orange
+    error_fg: Color::Rgb(0xfb, 0x49, 0x34),         // red
+    error_hover: Color::Rgb(0xfc, 0x7c, 0x6b),
+    error_surface: Color::Rgb(0x35, 0x1c, 0x18),
+    error_border: Color::Rgb(0xfb, 0x49, 0x34),
+    error_text: Color::Rgb(0xfc, 0xc4, 0xb8),
+    warning: Color::Rgb(0xfa, 0xbd, 0x2f),         // yellow
+    success: Color::Rgb(0x8e, 0xc0, 0x7c),         // green
+    info: Color::Rgb(0x83, 0xa5, 0x98),            // blue
+    mode_agent: Color::Rgb(0x83, 0xa5, 0x98),      // blue
+    mode_yolo: Color::Rgb(0xfb, 0x49, 0x34),       // red
+    mode_plan: Color::Rgb(0xfe, 0x80, 0x19),       // orange
+    mode_goal: Color::Rgb(0x8e, 0xc0, 0x7c),       // green
+    status_ready: Color::Rgb(0x92, 0x83, 0x74),    // gray
+    status_working: Color::Rgb(0x8e, 0xc0, 0x7c),  // aqua
+    status_warning: Color::Rgb(0xfa, 0xbd, 0x2f),  // yellow
+    diff_added_fg: Color::Rgb(0x8e, 0xc0, 0x7c),   // green
+    diff_deleted_fg: Color::Rgb(0xfb, 0x49, 0x34), // red
+    diff_added_bg: Color::Rgb(0x29, 0x32, 0x16),
+    diff_deleted_bg: Color::Rgb(0x35, 0x1c, 0x18),
+    tool_running: Color::Rgb(0x8e, 0xc0, 0x7c), // aqua
+    tool_success: Color::Rgb(0x92, 0x83, 0x74), // gray
+    tool_failed: Color::Rgb(0xfb, 0x49, 0x34),  // red
+};
+
+/// Stable identifiers for the named themes the user can select. `System`
+/// defers to `PaletteMode::detect()` (terminal-driven dark/light). Each
+/// dark/light id resolves to a single fixed `UiTheme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeId {
+    System,
+    Terminal,
+    Whale,
+    WhaleLight,
+    Grayscale,
+    CatppuccinMocha,
+    TokyoNight,
+    Dracula,
+    GruvboxDark,
+}
+
+impl ThemeId {
+    /// Parse a settings string (`"system"`, `"dark"`, `"catppuccin-mocha"`, …).
+    /// Accepts a few aliases (`"whale"` for dark, `"light"` for whale-light)
+    /// so existing config files keep working. Case-insensitive.
+    #[must_use]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match normalize_theme_name(value)? {
+            "system" => Some(Self::System),
+            "terminal" => Some(Self::Terminal),
+            "dark" => Some(Self::Whale),
+            "light" => Some(Self::WhaleLight),
+            "grayscale" => Some(Self::Grayscale),
+            "catppuccin-mocha" => Some(Self::CatppuccinMocha),
+            "tokyo-night" => Some(Self::TokyoNight),
+            "dracula" => Some(Self::Dracula),
+            "gruvbox-dark" => Some(Self::GruvboxDark),
+            _ => None,
+        }
+    }
+
+    /// Canonical settings string (lowercase, dash-separated). Round-trips
+    /// through `from_name`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Terminal => "terminal",
+            Self::Whale => "dark",
+            Self::WhaleLight => "light",
+            Self::Grayscale => "grayscale",
+            Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::TokyoNight => "tokyo-night",
+            Self::Dracula => "dracula",
+            Self::GruvboxDark => "gruvbox-dark",
+        }
+    }
+
+    /// Human-readable label for picker rows.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Terminal => "Terminal",
+            Self::Whale => "Whale (Dark)",
+            Self::WhaleLight => "Whale Light",
+            Self::Grayscale => "Grayscale",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Dracula => "Dracula",
+            Self::GruvboxDark => "Gruvbox Dark",
+        }
+    }
+
+    /// Short tagline for picker rows.
+    #[must_use]
+    pub const fn tagline(self) -> &'static str {
+        match self {
+            Self::System => "Follow terminal background (COLORFGBG / macOS appearance)",
+            Self::Terminal => "Inherit terminal colors fully (transparent surfaces, ANSI accents)",
+            Self::Whale => "Whale dark — deep navy & gold",
+            Self::WhaleLight => "DeepSeek light, paper-ish",
+            Self::Grayscale => "Color-minimal high contrast",
+            Self::CatppuccinMocha => "Soft pastels on warm dark",
+            Self::TokyoNight => "Deep blue/violet night palette",
+            Self::Dracula => "Classic high-contrast purple",
+            Self::GruvboxDark => "Vintage warm earth tones",
+        }
+    }
+
+    /// Resolve to a concrete `UiTheme`. For `System` this consults
+    /// `PaletteMode::detect()` exactly once and returns the corresponding
+    /// dark/light theme — callers that want to live-track terminal background
+    /// changes need to re-invoke this.
+    #[must_use]
+    pub fn ui_theme(self) -> UiTheme {
+        match self {
+            Self::System => UiTheme::detect(),
+            Self::Terminal => TERMINAL_UI_THEME,
+            Self::Whale => UI_THEME,
+            Self::WhaleLight => LIGHT_UI_THEME,
+            Self::Grayscale => GRAYSCALE_UI_THEME,
+            Self::CatppuccinMocha => CATPPUCCIN_MOCHA_UI_THEME,
+            Self::TokyoNight => TOKYO_NIGHT_UI_THEME,
+            Self::Dracula => DRACULA_UI_THEME,
+            Self::GruvboxDark => GRUVBOX_DARK_UI_THEME,
+        }
+    }
+}
+
+/// Themes shown in the `/theme` picker, in display order.
+pub const SELECTABLE_THEMES: &[ThemeId] = &[
+    ThemeId::System,
+    ThemeId::Terminal,
+    ThemeId::Whale,
+    ThemeId::WhaleLight,
+    ThemeId::Grayscale,
+    ThemeId::CatppuccinMocha,
+    ThemeId::TokyoNight,
+    ThemeId::Dracula,
+    ThemeId::GruvboxDark,
+];
+
+impl UiTheme {
+    #[must_use]
+    pub fn for_mode(mode: PaletteMode) -> Self {
+        match mode {
+            PaletteMode::Dark => UI_THEME,
+            PaletteMode::Light => LIGHT_UI_THEME,
+            PaletteMode::Grayscale => GRAYSCALE_UI_THEME,
+        }
+    }
+
+    #[must_use]
+    pub fn detect() -> Self {
+        Self::for_mode(PaletteMode::detect())
+    }
+
+    #[must_use]
+    pub fn from_setting(value: &str) -> Option<Self> {
+        ThemeId::from_name(value).map(ThemeId::ui_theme)
+    }
+
+    #[must_use]
+    pub fn with_background_color(mut self, color: Color) -> Self {
+        self.surface_bg = color;
+        self.header_bg = color;
+        self.footer_bg = color;
+        self
+    }
+}
+
+#[must_use]
+pub fn normalize_theme_name(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "system" | "default" => Some("system"),
+        "terminal" | "term" | "transparent" | "follow-terminal" | "inherit" => Some("terminal"),
+        "dark" | "whale" | "whale-dark" => Some("dark"),
+        "light" | "whale-light" => Some("light"),
+        "grayscale" | "greyscale" | "gray" | "grey" | "mono" | "monochrome" | "black-white"
+        | "black_and_white" | "blackwhite" | "bw" | "b&w" => Some("grayscale"),
+        "catppuccin-mocha" | "catppuccin" | "mocha" => Some("catppuccin-mocha"),
+        "tokyo-night" | "tokyonight" | "tokyo" => Some("tokyo-night"),
+        "dracula" => Some("dracula"),
+        "gruvbox-dark" | "gruvbox" => Some("gruvbox-dark"),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn theme_label_for_mode(mode: PaletteMode) -> &'static str {
+    match mode {
+        PaletteMode::Dark => "dark",
+        PaletteMode::Light => "light",
+        PaletteMode::Grayscale => "grayscale",
+    }
+}
+
+#[must_use]
+pub fn ui_theme_from_settings(theme: &str, background_color: Option<&str>) -> UiTheme {
+    let mut ui_theme = UiTheme::from_setting(theme).unwrap_or_else(UiTheme::detect);
+    if let Some(background) = background_color.and_then(parse_hex_rgb_color) {
+        ui_theme = ui_theme.with_background_color(background);
+    }
+    ui_theme
+}
+
+#[must_use]
+pub fn parse_hex_rgb_color(value: &str) -> Option<Color> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+#[must_use]
+pub fn normalize_hex_rgb_color(value: &str) -> Option<String> {
+    hex_rgb_string(parse_hex_rgb_color(value)?)
+}
+
+#[must_use]
+pub fn hex_rgb_string(color: Color) -> Option<String> {
+    let Color::Rgb(r, g, b) = color else {
+        return None;
+    };
+    Some(format!("#{r:02x}{g:02x}{b:02x}"))
+}
+
+#[must_use]
+pub fn adapt_fg_for_palette_mode(color: Color, _bg: Color, mode: PaletteMode) -> Color {
+    match mode {
+        PaletteMode::Dark => color,
+        PaletteMode::Light => adapt_fg_for_light_palette(color),
+        PaletteMode::Grayscale => adapt_fg_for_grayscale_palette(color),
+    }
+}
+
+#[must_use]
+pub fn adapt_bg_for_palette_mode(color: Color, mode: PaletteMode) -> Color {
+    match mode {
+        PaletteMode::Dark => color,
+        PaletteMode::Light => adapt_bg_for_light_palette(color),
+        PaletteMode::Grayscale => adapt_bg_for_grayscale_palette(color),
+    }
+}
+
+fn adapt_fg_for_light_palette(color: Color) -> Color {
+    if color == TEXT_BODY || color == SELECTION_TEXT || color == Color::White {
+        LIGHT_TEXT_BODY
+    } else if color == TEXT_SECONDARY || color == TEXT_MUTED {
+        LIGHT_TEXT_MUTED
+    } else if color == TEXT_HINT || color == TEXT_DIM {
+        LIGHT_TEXT_HINT
+    } else if color == TEXT_SOFT || color == TEXT_TOOL_OUTPUT {
+        LIGHT_TEXT_SOFT
+    } else if color == BORDER_COLOR {
+        LIGHT_BORDER
+    } else if color == TEXT_ACCENT || color == DEEPSEEK_SKY || color == ACCENT_TOOL_LIVE {
+        DEEPSEEK_BLUE
+    } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
+        Color::Rgb(146, 64, 14)
+    } else if color == ACCENT_TOOL_ISSUE {
+        Color::Rgb(159, 18, 57)
+    } else if color == DIFF_ADDED {
+        Color::Rgb(22, 101, 52)
+    } else if color == USER_BODY {
+        LIGHT_USER_BODY
+    } else {
+        color
+    }
+}
+
+fn adapt_bg_for_light_palette(color: Color) -> Color {
+    if color == DEEPSEEK_INK || color == BACKGROUND_DARK {
+        LIGHT_SURFACE
+    } else if color == DEEPSEEK_SLATE
+        || color == COMPOSER_BG
+        || color == SURFACE_PANEL
+        || color == SURFACE_TOOL
+    {
+        LIGHT_PANEL
+    } else if color == SURFACE_ELEVATED || color == SURFACE_TOOL_ACTIVE {
+        LIGHT_ELEVATED
+    } else if color == SURFACE_REASONING
+        || color == SURFACE_REASONING_TINT
+        || color == SURFACE_REASONING_ACTIVE
+    {
+        LIGHT_REASONING
+    } else if color == SURFACE_SUCCESS {
+        LIGHT_SUCCESS
+    } else if color == SURFACE_ERROR {
+        LIGHT_ERROR
+    } else if color == DIFF_ADDED_BG {
+        LIGHT_SUCCESS
+    } else if color == DIFF_DELETED_BG {
+        LIGHT_ERROR
+    } else if color == SELECTION_BG {
+        LIGHT_SELECTION_BG
+    } else {
+        color
+    }
+}
+
+// === Community-theme remap ===
+//
+// The vast majority of render sites in this crate reach for `palette::TEXT_*`,
+// `palette::DEEPSEEK_INK`, `palette::BORDER_COLOR`, etc. directly rather than
+// looking up `app.ui_theme`. To make community theme presets (Catppuccin,
+// Tokyo Night, …) actually move the needle visually we intercept colors at
+// the backend layer (see `tui::color_compat::ColorCompatBackend`) and remap
+// every well-known dark-palette constant to the equivalent UiTheme slot for
+// the active preset. For `System`, `Whale`, and `WhaleLight` the remap is a
+// no-op — the existing dark/light pipeline handles those.
+
+/// Per-preset green accent used for things that semantically *should* stay
+/// green even after theming (diff "+" lines, user-input body). Now delegates
+/// to the active UiTheme's diff_added_fg.
+#[must_use]
+const fn theme_green(ui: &UiTheme) -> Color {
+    ui.diff_added_fg
+}
+
+/// Per-preset red accent, used for diff "−" line foreground when present.
+#[must_use]
+#[allow(dead_code)]
+const fn theme_red(ui: &UiTheme) -> Color {
+    ui.diff_deleted_fg
+}
+
+/// Per-preset dark-green diff-added background tint.
+#[must_use]
+const fn theme_diff_added_bg(ui: &UiTheme) -> Color {
+    ui.diff_added_bg
+}
+
+/// Per-preset dark-red diff-deleted background tint.
+#[must_use]
+const fn theme_diff_deleted_bg(ui: &UiTheme) -> Color {
+    ui.diff_deleted_bg
+}
+
+/// Returns `true` if the preset participates in the cell-level remap. The
+/// default Whale and System themes pass through unchanged so this whole
+/// stage compiles down to a single load+compare on the hot path.
+#[inline]
+#[must_use]
+pub const fn theme_remap_active(theme: ThemeId) -> bool {
+    matches!(
+        theme,
+        ThemeId::Terminal
+            | ThemeId::CatppuccinMocha
+            | ThemeId::TokyoNight
+            | ThemeId::Dracula
+            | ThemeId::GruvboxDark
+    )
+}
+
+/// Remap a foreground color for a community theme preset. Mirrors the
+/// structure of [`adapt_fg_for_palette_mode`] — same source set, different
+/// destinations sourced from the preset's [`UiTheme`].
+///
+/// The `ui` argument is the *active* UiTheme as carried on `App` —
+/// `ThemeId.ui_theme()` with the user's `background_color` override
+/// already applied. Passing it through (rather than re-resolving from
+/// `theme` inside this function) preserves that override; otherwise a
+/// user combining `background_color = "#..."` with a community theme
+/// would see their override silently overwritten by the preset's
+/// surface_bg on every cell remap.
+#[must_use]
+pub fn adapt_fg_for_theme(color: Color, theme: ThemeId, ui: &UiTheme) -> Color {
+    if !theme_remap_active(theme) {
+        return color;
+    }
+
+    if color == TEXT_BODY || color == SELECTION_TEXT || color == Color::White {
+        ui.text_body
+    } else if color == TEXT_SECONDARY || color == TEXT_MUTED {
+        ui.text_muted
+    } else if color == TEXT_HINT || color == TEXT_DIM {
+        ui.text_hint
+    } else if color == TEXT_SOFT || color == TEXT_TOOL_OUTPUT {
+        ui.text_soft
+    } else if color == BORDER_COLOR {
+        ui.border
+    } else if color == TEXT_ACCENT || color == DEEPSEEK_SKY || color == ACCENT_TOOL_LIVE {
+        ui.status_working
+    } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
+        ui.mode_plan
+    } else if color == ACCENT_TOOL_ISSUE {
+        ui.mode_yolo
+    } else if color == STATUS_WARNING {
+        ui.warning
+    } else if color == STATUS_ERROR || color == DEEPSEEK_RED {
+        ui.error_fg
+    } else if color == DIFF_ADDED || color == USER_BODY {
+        theme_green(ui)
+    } else if color == DEEPSEEK_BLUE {
+        ui.mode_agent
+    } else {
+        color
+    }
+}
+
+/// Remap a background color for a community theme preset. See the
+/// `ui` note on [`adapt_fg_for_theme`] — same contract here.
+#[must_use]
+pub fn adapt_bg_for_theme(color: Color, theme: ThemeId, ui: &UiTheme) -> Color {
+    if !theme_remap_active(theme) {
+        return color;
+    }
+
+    if color == DEEPSEEK_INK || color == BACKGROUND_DARK {
+        ui.surface_bg
+    } else if color == DEEPSEEK_SLATE
+        || color == COMPOSER_BG
+        || color == SURFACE_PANEL
+        || color == SURFACE_TOOL
+    {
+        ui.panel_bg
+    } else if color == SURFACE_ELEVATED || color == SURFACE_TOOL_ACTIVE {
+        ui.elevated_bg
+    } else if color == SURFACE_REASONING
+        || color == SURFACE_REASONING_TINT
+        || color == SURFACE_REASONING_ACTIVE
+    {
+        ui.panel_bg
+    } else if color == SURFACE_SUCCESS {
+        ui.diff_added_bg
+    } else if color == SURFACE_ERROR {
+        ui.error_surface
+    } else if color == SELECTION_BG {
+        ui.selection_bg
+    } else if color == DIFF_ADDED_BG {
+        theme_diff_added_bg(ui)
+    } else if color == DIFF_DELETED_BG {
+        theme_diff_deleted_bg(ui)
+    } else {
+        color
+    }
+}
+
+fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
+    if color == Color::Reset {
+        return color;
+    }
+    if color == TEXT_BODY
+        || color == SELECTION_TEXT
+        || color == LIGHT_TEXT_BODY
+        || color == Color::White
+        || color == DEEPSEEK_RED
+        || color == STATUS_ERROR
+        || color == MODE_YOLO
+    {
+        GRAYSCALE_TEXT_BODY
+    } else if color == TEXT_SOFT
+        || color == TEXT_TOOL_OUTPUT
+        || color == LIGHT_TEXT_SOFT
+        || color == TEXT_ACCENT
+        || color == DEEPSEEK_SKY
+        || color == DEEPSEEK_BLUE
+        || color == ACCENT_TOOL_LIVE
+        || color == STATUS_SUCCESS
+        || color == STATUS_INFO
+        || color == MODE_AGENT
+    {
+        GRAYSCALE_TEXT_SOFT
+    } else if color == TEXT_SECONDARY
+        || color == TEXT_MUTED
+        || color == LIGHT_TEXT_MUTED
+        || color == TEXT_REASONING
+        || color == ACCENT_REASONING_LIVE
+        || color == STATUS_WARNING
+        || color == MODE_PLAN
+        || color == USER_BODY
+        || color == LIGHT_USER_BODY
+        || color == DIFF_ADDED
+    {
+        GRAYSCALE_TEXT_MUTED
+    } else if color == TEXT_HINT
+        || color == TEXT_DIM
+        || color == LIGHT_TEXT_HINT
+        || color == BORDER_COLOR
+        || color == LIGHT_BORDER
+        || color == ACCENT_TOOL_ISSUE
+    {
+        GRAYSCALE_TEXT_HINT
+    } else {
+        match color {
+            Color::Black => GRAYSCALE_TEXT_BODY,
+            Color::Gray | Color::DarkGray => GRAYSCALE_TEXT_HINT,
+            Color::Red
+            | Color::LightRed
+            | Color::Green
+            | Color::LightGreen
+            | Color::Yellow
+            | Color::LightYellow
+            | Color::Blue
+            | Color::LightBlue
+            | Color::Magenta
+            | Color::LightMagenta
+            | Color::Cyan
+            | Color::LightCyan => GRAYSCALE_TEXT_SOFT,
+            Color::Rgb(r, g, b) => grayscale_fg_from_luma(luma(r, g, b)),
+            Color::Indexed(_) => color,
+            _ => color,
+        }
+    }
+}
+
+fn adapt_bg_for_grayscale_palette(color: Color) -> Color {
+    if color == Color::Reset {
+        return color;
+    }
+    if color == DEEPSEEK_INK || color == BACKGROUND_DARK || color == LIGHT_SURFACE {
+        GRAYSCALE_SURFACE
+    } else if color == DEEPSEEK_SLATE
+        || color == COMPOSER_BG
+        || color == SURFACE_PANEL
+        || color == SURFACE_TOOL
+        || color == LIGHT_PANEL
+    {
+        GRAYSCALE_PANEL
+    } else if color == SURFACE_ELEVATED
+        || color == SURFACE_TOOL_ACTIVE
+        || color == LIGHT_ELEVATED
+        || color == SELECTION_BG
+        || color == LIGHT_SELECTION_BG
+    {
+        GRAYSCALE_ELEVATED
+    } else if color == SURFACE_REASONING
+        || color == SURFACE_REASONING_TINT
+        || color == SURFACE_REASONING_ACTIVE
+        || color == LIGHT_REASONING
+    {
+        GRAYSCALE_REASONING
+    } else if color == SURFACE_SUCCESS || color == DIFF_ADDED_BG || color == LIGHT_SUCCESS {
+        GRAYSCALE_SUCCESS
+    } else if color == SURFACE_ERROR || color == DIFF_DELETED_BG || color == LIGHT_ERROR {
+        GRAYSCALE_ERROR
+    } else {
+        match color {
+            Color::Black => GRAYSCALE_SURFACE,
+            Color::White | Color::Gray => GRAYSCALE_ELEVATED,
+            Color::DarkGray => GRAYSCALE_PANEL,
+            Color::Red
+            | Color::LightRed
+            | Color::Green
+            | Color::LightGreen
+            | Color::Yellow
+            | Color::LightYellow
+            | Color::Blue
+            | Color::LightBlue
+            | Color::Magenta
+            | Color::LightMagenta
+            | Color::Cyan
+            | Color::LightCyan => GRAYSCALE_ELEVATED,
+            Color::Rgb(r, g, b) => grayscale_bg_from_luma(luma(r, g, b)),
+            Color::Indexed(_) => color,
+            _ => color,
+        }
+    }
+}
+
+fn grayscale_fg_from_luma(luma: u8) -> Color {
+    match luma {
+        0..=95 => GRAYSCALE_TEXT_HINT,
+        96..=155 => GRAYSCALE_TEXT_MUTED,
+        156..=215 => GRAYSCALE_TEXT_SOFT,
+        _ => GRAYSCALE_TEXT_BODY,
+    }
+}
+
+fn grayscale_bg_from_luma(luma: u8) -> Color {
+    match luma {
+        0..=28 => GRAYSCALE_SURFACE,
+        29..=95 => GRAYSCALE_PANEL,
+        96..=185 => GRAYSCALE_ELEVATED,
+        _ => GRAYSCALE_REASONING,
+    }
+}
+
+fn luma(r: u8, g: u8, b: u8) -> u8 {
+    ((u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 + 500) / 1000) as u8
+}
 // === Color depth + brightness helpers (v0.6.6 UI redesign) ===
 
 /// Terminal color depth, used to gate truecolor surfaces (e.g. reasoning bg
@@ -230,6 +1580,7 @@ pub fn adapt_bg(color: Color, depth: ColorDepth) -> Color {
 /// Mix two RGB colors at `alpha` (0.0 = `bg`, 1.0 = `fg`). Anything that's not
 /// RGB falls back to `fg` — there's no meaningful alpha blend on a named
 /// palette entry.
+#[allow(dead_code)]
 #[must_use]
 pub fn blend(fg: Color, bg: Color, alpha: f32) -> Color {
     let alpha = alpha.clamp(0.0, 1.0);
@@ -246,18 +1597,14 @@ pub fn blend(fg: Color, bg: Color, alpha: f32) -> Color {
     }
 }
 
-/// Return the reasoning surface color tinted at 12% over the app background.
-/// This is the headline reasoning treatment in v0.6.6; a 12% blend keeps the
-/// warm bias subtle without competing with body text. Returns `None` when the
-/// terminal can't render the bg faithfully.
+/// Return the dedicated reasoning surface tint for terminals that can render
+/// background colors faithfully. ANSI-16 terminals disable the tint because
+/// the nearest named background is too coarse for this subtle treatment.
 #[must_use]
 pub fn reasoning_surface_tint(depth: ColorDepth) -> Option<Color> {
     match depth {
         ColorDepth::Ansi16 => None,
-        _ => Some(adapt_bg(
-            blend(SURFACE_REASONING, DEEPSEEK_INK, 0.12),
-            depth,
-        )),
+        _ => Some(adapt_bg(SURFACE_REASONING_TINT, depth)),
     }
 }
 
@@ -399,10 +1746,271 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
 mod tests {
     use super::{
         ACCENT_REASONING_LIVE, ColorDepth, DEEPSEEK_INK, DEEPSEEK_RED, DEEPSEEK_SKY,
-        SURFACE_REASONING, adapt_bg, adapt_color, blend, nearest_ansi16, pulse_brightness,
-        reasoning_surface_tint, rgb_to_ansi256,
+        DEEPSEEK_SLATE, DIFF_ADDED, DIFF_ADDED_BG, GRAYSCALE_BORDER, GRAYSCALE_ELEVATED,
+        GRAYSCALE_PANEL, GRAYSCALE_REASONING, GRAYSCALE_SURFACE, GRAYSCALE_TEXT_BODY,
+        GRAYSCALE_TEXT_HINT, GRAYSCALE_TEXT_SOFT, GRAYSCALE_UI_THEME, LIGHT_BORDER, LIGHT_ELEVATED,
+        LIGHT_PANEL, LIGHT_REASONING, LIGHT_SURFACE, LIGHT_TEXT_BODY, LIGHT_TEXT_HINT,
+        LIGHT_UI_THEME, PaletteMode, SURFACE_REASONING, SURFACE_REASONING_TINT, TERMINAL_UI_THEME,
+        TEXT_BODY, TEXT_HINT, TEXT_REASONING, TEXT_TOOL_OUTPUT, ThemeId, UI_THEME,
+        WHALE_REASONING_TEXT_RGB, WHALE_REASONING_TINT_RGB, WHALE_TEXT_BODY_RGB, adapt_bg,
+        adapt_bg_for_palette_mode, adapt_bg_for_theme, adapt_color, adapt_fg_for_palette_mode,
+        adapt_fg_for_theme, blend, luma, nearest_ansi16, normalize_hex_rgb_color,
+        normalize_theme_name, parse_hex_rgb_color, pulse_brightness, reasoning_surface_tint,
+        rgb_to_ansi256, theme_label_for_mode, ui_theme_from_settings,
     };
     use ratatui::style::Color;
+
+    #[test]
+    fn palette_mode_parses_colorfgbg_background_slot() {
+        assert_eq!(
+            PaletteMode::from_colorfgbg("0;15"),
+            Some(PaletteMode::Light)
+        );
+        assert_eq!(PaletteMode::from_colorfgbg("15;0"), Some(PaletteMode::Dark));
+        assert_eq!(
+            PaletteMode::from_colorfgbg("7;default;15"),
+            Some(PaletteMode::Light)
+        );
+        assert_eq!(PaletteMode::from_colorfgbg("not-a-color"), None);
+    }
+
+    #[test]
+    fn palette_mode_detect_prefers_colorfgbg_over_macos_fallback() {
+        assert_eq!(
+            PaletteMode::detect_from_sources(Some("0;15"), Some(PaletteMode::Dark)),
+            PaletteMode::Light
+        );
+        assert_eq!(
+            PaletteMode::detect_from_sources(Some("15;0"), Some(PaletteMode::Light)),
+            PaletteMode::Dark
+        );
+    }
+
+    #[test]
+    fn palette_mode_detect_uses_macos_fallback_when_colorfgbg_missing_or_invalid() {
+        assert_eq!(
+            PaletteMode::detect_from_sources(None, Some(PaletteMode::Light)),
+            PaletteMode::Light
+        );
+        assert_eq!(
+            PaletteMode::detect_from_sources(Some("not-a-color"), Some(PaletteMode::Light)),
+            PaletteMode::Light
+        );
+        assert_eq!(
+            PaletteMode::detect_from_sources(None, None),
+            PaletteMode::Dark
+        );
+    }
+
+    #[test]
+    fn apple_interface_style_maps_dark_and_missing_key_to_expected_modes() {
+        assert_eq!(
+            super::palette_mode_from_apple_interface_style("Dark\n"),
+            PaletteMode::Dark
+        );
+        assert_eq!(
+            super::palette_mode_from_apple_interface_style("Light\n"),
+            PaletteMode::Light
+        );
+        assert_eq!(
+            super::palette_mode_from_apple_interface_style(""),
+            PaletteMode::Light
+        );
+    }
+
+    #[test]
+    fn ui_theme_selects_light_variant() {
+        let theme = super::UiTheme::for_mode(PaletteMode::Light);
+        assert_eq!(theme, LIGHT_UI_THEME);
+        assert_eq!(theme.surface_bg, LIGHT_SURFACE);
+        assert_eq!(theme.text_body, LIGHT_TEXT_BODY);
+    }
+
+    #[test]
+    fn ui_theme_selects_grayscale_variant() {
+        let theme = super::UiTheme::for_mode(PaletteMode::Grayscale);
+        assert_eq!(theme, GRAYSCALE_UI_THEME);
+        assert_eq!(theme.surface_bg, GRAYSCALE_SURFACE);
+        assert_eq!(theme.panel_bg, GRAYSCALE_PANEL);
+        assert_eq!(theme.text_body, GRAYSCALE_TEXT_BODY);
+    }
+
+    #[test]
+    fn theme_names_normalize_common_grayscale_aliases() {
+        assert_eq!(normalize_theme_name("system"), Some("system"));
+        assert_eq!(normalize_theme_name("default"), Some("system"));
+        assert_eq!(normalize_theme_name("whale"), Some("dark"));
+        assert_eq!(normalize_theme_name("transparent"), Some("terminal"));
+        assert_eq!(normalize_theme_name("inherit"), Some("terminal"));
+        assert_eq!(normalize_theme_name("black-white"), Some("grayscale"));
+        assert_eq!(normalize_theme_name("mono"), Some("grayscale"));
+        assert_eq!(normalize_theme_name("solarized"), None);
+        assert_eq!(theme_label_for_mode(PaletteMode::Grayscale), "grayscale");
+    }
+
+    #[test]
+    fn terminal_theme_resets_surfaces_and_remaps_direct_palette_constants() {
+        assert_eq!(ThemeId::from_name("terminal"), Some(ThemeId::Terminal));
+        assert_eq!(TERMINAL_UI_THEME.surface_bg, Color::Reset);
+        assert_eq!(TERMINAL_UI_THEME.footer_bg, Color::Reset);
+        assert_eq!(TERMINAL_UI_THEME.text_body, Color::Reset);
+
+        assert_eq!(
+            adapt_bg_for_theme(DEEPSEEK_INK, ThemeId::Terminal, &TERMINAL_UI_THEME),
+            Color::Reset
+        );
+        assert_eq!(
+            adapt_bg_for_theme(DIFF_ADDED_BG, ThemeId::Terminal, &TERMINAL_UI_THEME),
+            Color::Reset
+        );
+        assert_eq!(
+            adapt_fg_for_theme(TEXT_BODY, ThemeId::Terminal, &TERMINAL_UI_THEME),
+            Color::Reset
+        );
+        assert_eq!(
+            adapt_fg_for_theme(DIFF_ADDED, ThemeId::Terminal, &TERMINAL_UI_THEME),
+            Color::Green
+        );
+    }
+
+    #[test]
+    fn light_palette_has_quiet_layer_separation() {
+        assert_eq!(LIGHT_SURFACE, Color::Rgb(246, 248, 251));
+        assert_eq!(LIGHT_PANEL, Color::Rgb(236, 242, 248));
+        assert_eq!(LIGHT_ELEVATED, Color::Rgb(219, 229, 240));
+        assert_eq!(LIGHT_BORDER, Color::Rgb(139, 161, 184));
+        assert_ne!(LIGHT_SURFACE, LIGHT_PANEL);
+        assert_ne!(LIGHT_PANEL, LIGHT_ELEVATED);
+    }
+
+    #[test]
+    fn dark_palette_uses_soft_body_text_and_warm_reasoning() {
+        assert_eq!(
+            TEXT_BODY,
+            Color::Rgb(
+                WHALE_TEXT_BODY_RGB.0,
+                WHALE_TEXT_BODY_RGB.1,
+                WHALE_TEXT_BODY_RGB.2
+            )
+        );
+        assert_eq!(
+            TEXT_REASONING,
+            Color::Rgb(
+                WHALE_REASONING_TEXT_RGB.0,
+                WHALE_REASONING_TEXT_RGB.1,
+                WHALE_REASONING_TEXT_RGB.2
+            )
+        );
+        assert_eq!(
+            ACCENT_REASONING_LIVE,
+            Color::Rgb(
+                WHALE_REASONING_TEXT_RGB.0,
+                WHALE_REASONING_TEXT_RGB.1,
+                WHALE_REASONING_TEXT_RGB.2
+            )
+        );
+        assert_ne!(TEXT_REASONING, TEXT_TOOL_OUTPUT);
+        assert_ne!(TEXT_BODY, Color::White);
+    }
+
+    #[test]
+    fn ui_theme_applies_custom_background_to_base_surfaces() {
+        let custom = Color::Rgb(26, 27, 38);
+        let theme = super::UiTheme::for_mode(PaletteMode::Dark).with_background_color(custom);
+
+        assert_eq!(theme.surface_bg, custom);
+        assert_eq!(theme.header_bg, custom);
+        assert_eq!(theme.footer_bg, custom);
+        assert_eq!(
+            theme.composer_bg, UI_THEME.composer_bg,
+            "custom background must not erase panel contrast"
+        );
+    }
+
+    #[test]
+    fn hex_rgb_color_parser_accepts_hashless_and_normalizes() {
+        assert_eq!(parse_hex_rgb_color("#1a1B26"), Some(Color::Rgb(26, 27, 38)));
+        assert_eq!(parse_hex_rgb_color("1a1b26"), Some(Color::Rgb(26, 27, 38)));
+        assert_eq!(
+            normalize_hex_rgb_color("#1A1B26").as_deref(),
+            Some("#1a1b26")
+        );
+        assert_eq!(parse_hex_rgb_color("#123"), None);
+        assert_eq!(parse_hex_rgb_color("#zzzzzz"), None);
+    }
+
+    #[test]
+    fn light_palette_maps_dark_surfaces_and_text() {
+        assert_eq!(
+            adapt_bg_for_palette_mode(DEEPSEEK_INK, PaletteMode::Light),
+            LIGHT_SURFACE
+        );
+        assert_eq!(
+            adapt_bg_for_palette_mode(DEEPSEEK_SLATE, PaletteMode::Light),
+            LIGHT_PANEL
+        );
+        assert_eq!(
+            adapt_fg_for_palette_mode(Color::White, LIGHT_SURFACE, PaletteMode::Light),
+            LIGHT_TEXT_BODY
+        );
+        assert_eq!(
+            adapt_fg_for_palette_mode(TEXT_HINT, LIGHT_SURFACE, PaletteMode::Light),
+            LIGHT_TEXT_HINT
+        );
+    }
+
+    #[test]
+    fn grayscale_palette_maps_brand_hues_to_neutral_roles() {
+        assert_eq!(
+            adapt_bg_for_palette_mode(DEEPSEEK_INK, PaletteMode::Grayscale),
+            GRAYSCALE_SURFACE
+        );
+        assert_eq!(
+            adapt_bg_for_palette_mode(DEEPSEEK_SLATE, PaletteMode::Grayscale),
+            GRAYSCALE_PANEL
+        );
+        assert_eq!(
+            adapt_bg_for_palette_mode(SURFACE_REASONING, PaletteMode::Grayscale),
+            GRAYSCALE_REASONING
+        );
+        assert_eq!(
+            adapt_fg_for_palette_mode(DEEPSEEK_SKY, GRAYSCALE_SURFACE, PaletteMode::Grayscale),
+            GRAYSCALE_TEXT_SOFT
+        );
+        assert_eq!(
+            adapt_fg_for_palette_mode(DEEPSEEK_RED, GRAYSCALE_SURFACE, PaletteMode::Grayscale),
+            GRAYSCALE_TEXT_BODY
+        );
+        assert_eq!(
+            adapt_fg_for_palette_mode(TEXT_HINT, GRAYSCALE_SURFACE, PaletteMode::Grayscale),
+            GRAYSCALE_TEXT_HINT
+        );
+    }
+
+    #[test]
+    fn grayscale_luma_handles_bright_rgb_without_overflow() {
+        assert_eq!(luma(255, 255, 255), 255);
+        assert_eq!(
+            adapt_fg_for_palette_mode(
+                Color::Rgb(255, 255, 255),
+                GRAYSCALE_SURFACE,
+                PaletteMode::Grayscale
+            ),
+            GRAYSCALE_TEXT_BODY
+        );
+    }
+
+    #[test]
+    fn ui_theme_from_settings_applies_theme_and_background() {
+        let theme = ui_theme_from_settings("grayscale", Some("#111111"));
+        assert_eq!(theme.mode, PaletteMode::Grayscale);
+        assert_eq!(theme.surface_bg, Color::Rgb(17, 17, 17));
+        assert_eq!(theme.header_bg, Color::Rgb(17, 17, 17));
+        assert_eq!(theme.footer_bg, Color::Rgb(17, 17, 17));
+        assert_eq!(theme.panel_bg, GRAYSCALE_PANEL);
+        assert_eq!(theme.elevated_bg, GRAYSCALE_ELEVATED);
+        assert_eq!(theme.border, GRAYSCALE_BORDER);
+    }
 
     #[test]
     fn adapt_color_passes_through_truecolor() {
@@ -434,8 +2042,12 @@ mod tests {
             adapt_color(DEEPSEEK_SKY, ColorDepth::Ansi16),
             Color::LightBlue
         );
-        // Red: red-dominant, mid lum → Red (not the bright variant).
-        assert_eq!(adapt_color(DEEPSEEK_RED, ColorDepth::Ansi16), Color::Red);
+        // Rose Red is intentionally bright enough to use the terminal's
+        // bright red slot.
+        assert_eq!(
+            adapt_color(DEEPSEEK_RED, ColorDepth::Ansi16),
+            Color::LightRed
+        );
     }
 
     #[test]
@@ -458,6 +2070,29 @@ mod tests {
             reasoning_surface_tint(ColorDepth::Ansi256),
             Some(Color::Indexed(_))
         ));
+    }
+
+    #[test]
+    fn light_palette_maps_reasoning_tint_to_light_surface() {
+        assert_eq!(
+            SURFACE_REASONING_TINT,
+            Color::Rgb(
+                WHALE_REASONING_TINT_RGB.0,
+                WHALE_REASONING_TINT_RGB.1,
+                WHALE_REASONING_TINT_RGB.2
+            )
+        );
+        assert_eq!(
+            adapt_bg_for_palette_mode(SURFACE_REASONING_TINT, PaletteMode::Light),
+            LIGHT_REASONING
+        );
+        assert_eq!(
+            adapt_bg_for_palette_mode(
+                reasoning_surface_tint(ColorDepth::TrueColor).expect("truecolor tint"),
+                PaletteMode::Light,
+            ),
+            LIGHT_REASONING
+        );
     }
 
     #[test]
@@ -504,14 +2139,13 @@ mod tests {
 
     #[test]
     fn nearest_ansi16_routes_known_brand_colors() {
-        // Blue-dominant brand colors should stay blue rather than collapsing
-        // to the user's terminal cyan, which is often much louder.
-        assert_eq!(nearest_ansi16(53, 120, 229), Color::Blue);
-        assert_eq!(nearest_ansi16(106, 174, 242), Color::LightBlue);
-        assert_eq!(nearest_ansi16(42, 74, 127), Color::Blue);
-        assert_eq!(nearest_ansi16(54, 187, 212), Color::LightCyan);
-        assert_eq!(nearest_ansi16(226, 80, 96), Color::Red);
-        assert_eq!(nearest_ansi16(11, 21, 38), Color::Black);
+        // v0.8.45: accent primary is Signal Gold (#F6C453), secondary is Seafoam.
+        assert_eq!(nearest_ansi16(246, 196, 83), Color::LightYellow); // Signal Gold
+        assert_eq!(nearest_ansi16(79, 209, 197), Color::LightCyan); // Seafoam
+        assert_eq!(nearest_ansi16(42, 74, 127), Color::Blue); // Border
+        assert_eq!(nearest_ansi16(54, 187, 212), Color::LightCyan); // Aqua
+        assert_eq!(nearest_ansi16(255, 92, 122), Color::LightRed); // Rose Red
+        assert_eq!(nearest_ansi16(13, 21, 37), Color::Black); // Deep Navy
     }
 
     #[test]

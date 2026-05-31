@@ -3,6 +3,10 @@
 // approval-modal hook that v0.7.x adds incrementally. Dead-code warnings
 // would otherwise be noisy until those call sites land.
 #![allow(dead_code)]
+// Audit-write failure must route through `tracing::*`, not raw stderr —
+// see `runtime_log` for the scroll-demon rationale.
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
 
 //! Per-domain network policy for outbound network calls (#135).
 //!
@@ -33,7 +37,7 @@
 //! # Audit-log format
 //!
 //! ```text
-//! <RFC3339-timestamp> network <host> <tool> <Allow|Deny|Prompt-Approved|Prompt-Denied>
+//! <RFC3339-timestamp> network <host> <tool> <Allow|Deny|Prompt-Approved|Prompt-Denied|TrustedProxyFakeIp-Allow>
 //! ```
 //!
 //! Plaintext, one line per call, appended to `<audit_path>` (defaults to
@@ -42,6 +46,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -98,6 +103,10 @@ pub struct NetworkPolicy {
     /// Hosts that should always be denied.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Hostnames whose DNS may resolve to fake-IP/private proxy ranges in an
+    /// explicitly trusted proxy setup. This does not affect literal IP URLs.
+    #[serde(default)]
+    pub proxy: Vec<String>,
     /// Whether to record one audit-log line per network call. Defaults to true.
     #[serde(default = "default_audit")]
     pub audit: bool,
@@ -117,6 +126,7 @@ impl Default for NetworkPolicy {
             default: DecisionToml::Prompt,
             allow: Vec::new(),
             deny: Vec::new(),
+            proxy: Vec::new(),
             audit: true,
         }
     }
@@ -205,6 +215,26 @@ impl NetworkPolicy {
     pub fn audit_enabled(&self) -> bool {
         self.audit
     }
+
+    /// Whether `host` is explicitly trusted to resolve through a local
+    /// fake-IP proxy. Deny entries still win over this list.
+    #[must_use]
+    pub fn trusts_proxy_fakeip_host(&self, host: &str) -> bool {
+        let normalized = normalize_host(host);
+        if normalized.is_empty() {
+            return false;
+        }
+        if self
+            .deny
+            .iter()
+            .any(|entry| host_matches(entry, &normalized))
+        {
+            return false;
+        }
+        self.proxy
+            .iter()
+            .any(|entry| host_matches(entry, &normalized))
+    }
 }
 
 /// Normalize a host for matching: lowercase, trim whitespace, strip a single
@@ -236,6 +266,27 @@ fn host_matches(entry: &str, normalized_host: &str) -> bool {
     }
 }
 
+/// Parse an IPv4 CIDR string such as `"198.18.0.0/15"` into `(base, prefix)`.
+/// Returns `None` for malformed input or a prefix length above 32.
+fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let base: Ipv4Addr = addr.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    Some((base, prefix))
+}
+
+/// Whether `ip` is contained in the `base/prefix` IPv4 CIDR block.
+fn ipv4_in_cidr(ip: Ipv4Addr, base: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask: u32 = u32::MAX << (32 - prefix);
+    (u32::from(ip) & mask) == (u32::from(base) & mask)
+}
+
 /// Best-effort writer for the network audit log.
 #[derive(Debug, Clone)]
 pub struct NetworkAuditor {
@@ -265,7 +316,11 @@ impl NetworkAuditor {
             return;
         }
         if let Err(err) = self.try_record(host, tool, decision_label) {
-            eprintln!("network audit write failed: {err}");
+            // Routed through tracing so it lands in
+            // `~/.deepseek/logs/tui-YYYY-MM-DD.log` rather than the
+            // alt-screen — see `runtime_log` for the scroll-demon
+            // rationale.
+            tracing::warn!(target: "network_policy", ?err, host, tool, "network audit write failed");
         }
     }
 
@@ -382,6 +437,12 @@ pub struct NetworkPolicyDecider {
     policy: NetworkPolicy,
     cache: NetworkSessionCache,
     auditor: Option<NetworkAuditor>,
+    /// IPv4 CIDR ranges that are treated as benign fake-IP placeholders (e.g.
+    /// a transparent-proxy / TUN setup running in `fake-ip` mode, where DNS
+    /// resolves every hostname into a reserved range like `198.18.0.0/15`).
+    /// A resolved IP inside one of these ranges bypasses the restricted-IP SSRF
+    /// block; real private/loopback/link-local/metadata IPs are unaffected.
+    trusted_fakeip_cidrs: Vec<(Ipv4Addr, u8)>,
 }
 
 impl NetworkPolicyDecider {
@@ -392,6 +453,38 @@ impl NetworkPolicyDecider {
             policy,
             cache: NetworkSessionCache::new(),
             auditor,
+            trusted_fakeip_cidrs: Vec::new(),
+        }
+    }
+
+    /// Register IPv4 CIDR ranges to treat as benign fake-IP placeholders.
+    /// Invalid CIDR strings are skipped. See [`Self::is_trusted_fakeip_addr`].
+    #[must_use]
+    pub fn with_trusted_fakeip_cidrs(mut self, cidrs: &[&str]) -> Self {
+        for cidr in cidrs {
+            if let Some(parsed) = parse_ipv4_cidr(cidr) {
+                self.trusted_fakeip_cidrs.push(parsed);
+            }
+        }
+        self
+    }
+
+    /// Whether `ip` falls inside a configured fake-IP placeholder range.
+    ///
+    /// In `fake-ip` proxy/TUN setups the local resolver maps every hostname to
+    /// a reserved range (commonly `198.18.0.0/15`), so the DNS-resolution SSRF
+    /// check would otherwise reject every request. This narrowly trusts only
+    /// those placeholder addresses — real private/loopback/link-local/cloud-
+    /// metadata IPs are *not* matched and stay blocked.
+    #[must_use]
+    pub fn is_trusted_fakeip_addr(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self
+                .trusted_fakeip_cidrs
+                .iter()
+                .any(|(base, prefix)| ipv4_in_cidr(*v4, *base, *prefix)),
+            // fake-ip placeholders are IPv4-only in practice.
+            IpAddr::V6(_) => false,
         }
     }
 
@@ -471,6 +564,19 @@ impl NetworkPolicyDecider {
         &self.policy
     }
 
+    /// Whether this host is explicitly configured for trusted proxy fake-IP
+    /// DNS handling.
+    #[must_use]
+    pub fn trusts_proxy_fakeip_host(&self, host: &str) -> bool {
+        self.policy.trusts_proxy_fakeip_host(host)
+    }
+
+    /// Record that a restricted DNS result was allowed because the host is in
+    /// the trusted proxy fake-IP list.
+    pub fn record_trusted_proxy_fakeip_allow(&self, host: &str, tool: &str) {
+        self.audit_record(host, tool, "TrustedProxyFakeIp-Allow");
+    }
+
     fn audit_record(&self, host: &str, tool: &str, label: &str) {
         if let Some(auditor) = self.auditor.as_ref() {
             auditor.record(host, tool, label);
@@ -496,6 +602,7 @@ mod tests {
             default: default.into(),
             allow: allow.iter().map(|s| (*s).to_string()).collect(),
             deny: deny.iter().map(|s| (*s).to_string()).collect(),
+            proxy: Vec::new(),
             audit: false,
         }
     }
@@ -571,6 +678,53 @@ mod tests {
         p.add_allow("example.com");
         assert_eq!(p.allow.len(), 1);
         assert_eq!(p.allow[0], "example.com");
+    }
+
+    #[test]
+    fn trusted_proxy_fakeip_hosts_match_exact_and_subdomains() {
+        let mut p = mk(Decision::Deny, &[], &[]);
+        p.proxy = vec![
+            "github.com".to_string(),
+            ".githubusercontent.com".to_string(),
+        ];
+
+        assert!(p.trusts_proxy_fakeip_host("github.com"));
+        assert!(p.trusts_proxy_fakeip_host("raw.githubusercontent.com"));
+        assert!(!p.trusts_proxy_fakeip_host("githubusercontent.com"));
+        assert!(!p.trusts_proxy_fakeip_host("example.com"));
+    }
+
+    #[test]
+    fn trusted_proxy_fakeip_hosts_respect_deny_precedence() {
+        let mut p = mk(Decision::Allow, &[], &["raw.githubusercontent.com"]);
+        p.proxy = vec![".githubusercontent.com".to_string()];
+
+        assert!(!p.trusts_proxy_fakeip_host("raw.githubusercontent.com"));
+        assert!(p.trusts_proxy_fakeip_host("avatars.githubusercontent.com"));
+    }
+
+    #[test]
+    fn trusted_fakeip_cidr_allows_placeholder_but_not_real_private() {
+        let decider = NetworkPolicyDecider::new(NetworkPolicy::default(), None)
+            .with_trusted_fakeip_cidrs(&["198.18.0.0/15"]);
+
+        // fake-ip placeholder range (clash default / IETF benchmark) is trusted
+        assert!(decider.is_trusted_fakeip_addr(&"198.18.0.5".parse::<std::net::IpAddr>().unwrap()));
+        assert!(
+            decider.is_trusted_fakeip_addr(&"198.19.255.255".parse::<std::net::IpAddr>().unwrap())
+        );
+
+        // real private / loopback / link-local / cloud-metadata are NOT trusted
+        for ip in ["192.168.1.1", "10.0.0.1", "127.0.0.1", "169.254.169.254"] {
+            assert!(
+                !decider.is_trusted_fakeip_addr(&ip.parse::<std::net::IpAddr>().unwrap()),
+                "{ip} must not be treated as a fake-ip placeholder"
+            );
+        }
+
+        // no ranges configured → nothing trusted
+        let bare = NetworkPolicyDecider::new(NetworkPolicy::default(), None);
+        assert!(!bare.is_trusted_fakeip_addr(&"198.18.0.5".parse::<std::net::IpAddr>().unwrap()));
     }
 
     #[test]

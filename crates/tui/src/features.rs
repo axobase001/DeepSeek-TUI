@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Feature flags and metadata for DeepSeek TUI.
+//! Feature flags and metadata for codewhale.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -44,6 +44,8 @@ pub enum Feature {
     Mcp,
     /// Enable execpolicy integration/tooling.
     ExecPolicy,
+    /// Enable vision model for image analysis.
+    VisionModel,
 }
 
 impl fmt::Display for Stage {
@@ -206,6 +208,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "exec_policy",
         stage: Stage::Experimental,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::VisionModel,
+        key: "vision_model",
+        stage: Stage::Experimental,
+        default_enabled: false,
     },
 ];
 

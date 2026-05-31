@@ -1,7 +1,7 @@
 //! Cargo test runner tool: `run_tests`.
 //!
-//! This tool intentionally auto-approves test execution to encourage
-//! frequent verification loops while still scoping execution to the workspace.
+//! `cargo test` runs workspace code, so this tool follows the same explicit
+//! approval policy as the other code-executing tools.
 
 use std::path::Path;
 use std::process::Command;
@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::cargo_failure_summary::summarize_cargo_failure;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str,
@@ -61,8 +62,9 @@ impl ToolSpec for RunTestsTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        // Tests are encouraged, so avoid gating them behind approval.
-        ApprovalRequirement::Auto
+        // `run_tests` declares `ToolCapability::ExecutesCode` — match the
+        // default approval policy for code-executing tools.
+        ApprovalRequirement::Required
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -99,7 +101,20 @@ impl ToolSpec for RunTestsTool {
             command: command_str,
         };
 
-        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
+        let mut tool_result =
+            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        if let Some(summary) = summarize_cargo_failure(
+            &result.command,
+            &result.stdout,
+            &result.stderr,
+            Some(result.exit_code),
+        ) {
+            tool_result = tool_result.with_metadata(json!({
+                "summary": summary.summary,
+                "cargo_failure_summary": summary.to_metadata_value(),
+            }));
+        }
+        Ok(tool_result)
     }
 }
 
@@ -191,6 +206,18 @@ mod tests {
         project_dir
     }
 
+    /// `run_tests` is `ToolCapability::ExecutesCode`, so it must follow the
+    /// explicit-approval policy that applies to other code-executing tools.
+    #[test]
+    fn run_tests_requires_user_approval() {
+        let tool = RunTestsTool;
+        assert_eq!(
+            tool.approval_requirement(),
+            ApprovalRequirement::Required,
+            "run_tests must gate cargo test behind user approval"
+        );
+    }
+
     #[tokio::test]
     async fn run_tests_succeeds_on_fresh_project() {
         if !cargo_available() {
@@ -242,6 +269,17 @@ mod tests {
             serde_json::from_str(&result.content).expect("tool result should be json");
         assert!(!parsed.success);
         assert_ne!(parsed.exit_code, 0);
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(
+            metadata["cargo_failure_summary"]["kind"],
+            json!("test_failure")
+        );
+        assert!(
+            metadata["cargo_failure_summary"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Failing tests:")
+        );
     }
 
     #[test]

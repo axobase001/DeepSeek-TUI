@@ -16,6 +16,44 @@ use crate::tools::spec::ToolResult;
 /// `max_tokens` near pressure; hard-cycle/preflight checks reserve this budget
 /// plus safety headroom before sending the next request.
 pub(super) const TURN_MAX_OUTPUT_TOKENS: u32 = 262_144;
+
+/// Safe max output tokens sent in the API request. This must be low enough to
+/// work with providers that have smaller context limits than the model's native
+/// window (e.g., self-hosted vLLM/SGLang with `--max-model-len 131072`).
+/// DeepSeek's API will still produce as many tokens as needed for thinking;
+/// this cap just prevents HTTP 400 from providers with tight limits.
+const API_MAX_OUTPUT_TOKENS: u32 = 65_536;
+
+/// Compute the effective `max_tokens` to send in the API request for a given
+/// model. Uses `API_MAX_OUTPUT_TOKENS` (64K) which fits within common provider
+/// limits (128K+ total). For non-V4 models with smaller context windows, caps
+/// at half the context window.
+///
+/// Override: when the env var `DEEPSEEK_MAX_OUTPUT_TOKENS` is set to a positive
+/// integer, this function returns that value directly. Use this for self-hosted
+/// providers (vLLM/SGLang) whose `max-model-len` is tight and where the
+/// model-table heuristic above would over-allocate. Example: vLLM serving
+/// Qwen3.6 with `--max-model-len 65536` should set
+/// `DEEPSEEK_MAX_OUTPUT_TOKENS=16384` so input + output stays well under the
+/// provider's hard limit.
+pub(super) fn effective_max_output_tokens(model: &str) -> u32 {
+    if let Ok(raw) = std::env::var("DEEPSEEK_MAX_OUTPUT_TOKENS")
+        && let Ok(n) = raw.trim().parse::<u32>()
+        && n > 0
+    {
+        return n;
+    }
+    let window = context_window_for_model(model).unwrap_or(128_000);
+    if window >= 500_000 {
+        // V4-class models on large-context providers: use 64K which is safe
+        // for most deployments while still allowing substantial output.
+        API_MAX_OUTPUT_TOKENS
+    } else {
+        // Smaller models: cap at half the context window (leave room for input)
+        let capped = window / 2;
+        capped.min(API_MAX_OUTPUT_TOKENS)
+    }
+}
 /// Keep this many most recent messages when emergency trimming is required.
 pub(super) const MIN_RECENT_MESSAGES_TO_KEEP: usize = 4;
 /// Allow a few emergency recovery attempts before failing the turn.
@@ -122,6 +160,10 @@ fn summarize_subagent_status(status: &serde_json::Value) -> String {
 }
 
 fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> String {
+    if let Some(inner) = snapshot.get("snapshot") {
+        return summarize_subagent_snapshot(inner, index);
+    }
+
     let Some(obj) = snapshot.as_object() else {
         return format!(
             "- item {index}: {}",
@@ -178,7 +220,16 @@ fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> St
 }
 
 fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
-    if !matches!(tool_name, "agent_result" | "agent_wait" | "wait") {
+    if !matches!(
+        tool_name,
+        "agent_open"
+            | "agent_eval"
+            | "agent_close"
+            | "agent_result"
+            | "agent_wait"
+            | "tool_agent"
+            | "wait"
+    ) {
         return None;
     }
 
@@ -190,7 +241,10 @@ fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Optio
     };
 
     let mut out = String::from("[sub-agent result summarized for parent context]\n");
-    out.push_str("Use `agent_result` again only if you need the full raw payload.\n");
+    out.push_str(
+        "Child results are self-reports; verify side effects with tools like read_file or list_dir before claiming success.\n",
+    );
+    out.push_str("Use `agent_eval` for a fresh projection or `handle_read` on `transcript_handle` for bounded transcript slices.\n");
     for (idx, snapshot) in snapshots.iter().enumerate() {
         if idx >= 8 {
             out.push_str(&format!(
@@ -314,9 +368,35 @@ pub(super) fn estimate_input_tokens_conservative(
         .saturating_add(framing_overhead)
 }
 
-pub(super) fn context_input_budget(model: &str, requested_output_tokens: u32) -> Option<usize> {
-    let window = usize::try_from(context_window_for_model(model)?).ok()?;
-    let output = usize::try_from(requested_output_tokens).ok()?;
+/// Context windows at or above this size reserve the full
+/// [`TURN_MAX_OUTPUT_TOKENS`] (262K) when computing the internal input budget,
+/// leaving room for V4-class interleaved thinking. Below it, the reservation
+/// falls back to [`effective_max_output_tokens`] so a smaller self-hosted
+/// window does not underflow to a negative budget.
+const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
+
+/// Internal input-side token budget for a model: `window - reserved_output -
+/// headroom`. Used by the preflight check, emergency recovery, and capacity
+/// trimming to decide when to compact.
+///
+/// The reserved-output term is window-dependent:
+///   * `window >= 500K` (V4-class large-context) -> [`TURN_MAX_OUTPUT_TOKENS`]
+///     (262K). Preserves the "leave room for interleaved thinking" contract.
+///   * `window < 500K` (smaller / self-hosted, e.g. a 256K vLLM Qwen window)
+///     -> [`effective_max_output_tokens`], i.e. what the API actually caps
+///     output at. Reserving the full 262K here would compute
+///     `256K - 262K - 1K`, which underflows `checked_sub` to `None` and
+///     *silently disables every preflight and emergency recovery path* — the
+///     session then runs until the provider hard-rejects on context length.
+pub(super) fn context_input_budget(model: &str) -> Option<usize> {
+    let window_tokens = context_window_for_model(model)?;
+    let window = usize::try_from(window_tokens).ok()?;
+    let reserved_output = if window_tokens >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
+        TURN_MAX_OUTPUT_TOKENS
+    } else {
+        effective_max_output_tokens(model)
+    };
+    let output = usize::try_from(reserved_output).ok()?;
     window
         .checked_sub(output)
         .and_then(|v| v.checked_sub(CONTEXT_HEADROOM_TOKENS))

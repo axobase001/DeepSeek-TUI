@@ -23,6 +23,8 @@ These locales are supported by `locale` in `settings.toml` and by `LANG` / `LC_A
 | `ja` | Japanese | Jpan | LTR | `en` | v0.7.6 must-have | Core TUI chrome | Covers composer placeholder/history search, help chrome, and `/config` chrome. |
 | `zh-Hans` | Chinese Simplified | Hans | LTR | `en` | v0.7.6 must-have | Core TUI chrome | `zh`, `zh-CN`, and `zh-Hans` resolve here. Traditional Chinese is not shipped. |
 | `pt-BR` | Portuguese (Brazil) | Latin | LTR | `en` | v0.7.6 must-have | Core TUI chrome | `pt` and `pt-PT` currently fall back to Brazilian Portuguese; European Portuguese is not separately shipped. |
+| `es-419` | Spanish (Latin America) | Latin | LTR | `en` | v0.7.6 must-have | Core TUI chrome | `es` and regional variants resolve here. |
+| `vi` | Vietnamese | Latin | LTR | `en` | v0.7.6 must-have | Core TUI chrome | Fully translated UI chrome, automated width tested. |
 
 Selection:
 
@@ -31,13 +33,18 @@ locale = "auto"     # default; checks LC_ALL, LC_MESSAGES, then LANG
 locale = "ja"
 locale = "zh-Hans"
 locale = "pt-BR"
+locale = "es-419"
+locale = "vi"
 ```
 
 Fallback:
 
 - Missing or unsupported configured locales fall back to English.
 - `auto` falls back to English when no supported environment locale is detected.
-- UI locale is separate from model prompt language. Users still ask the model for a response language in the prompt.
+- The resolved locale is included in the system prompt as the fallback natural
+  language for V4 reasoning and replies. The latest user message takes priority,
+  including for `reasoning_content`, so a Chinese turn should remain Chinese
+  even when the resolved locale is English.
 
 ## Planned Global South QA Matrix
 
@@ -49,12 +56,10 @@ These are not claimed as shipped translations in v0.7.6 unless a later change ad
 | `hi` | Hindi | Deva | LTR | Follow-up | Planned | `en` | Automated renderer sample only; native review preferred before shipping | Combining marks, cursor width, truncation |
 | `bn` | Bengali | Beng | LTR | Follow-up | Planned | `en` | Matrix only; native review required before shipping | Combining marks, line wrapping |
 | `id` | Indonesian | Latin | LTR | Follow-up | Planned | `en` | Matrix only; automated narrow-width snapshots and reviewer pass required | Longer labels than English |
-| `vi` | Vietnamese | Latin | LTR | Follow-up | Planned | `en` | Matrix only; automated width snapshots and reviewer pass required | Diacritics and wrapped labels |
 | `sw` | Swahili | Latin | LTR | Follow-up | Planned | `en` | Matrix only; native or fluent review required before shipping | Translation quality, longer command descriptions |
 | `ha` | Hausa | Latin | LTR | Follow-up | Planned | `en` | Matrix only; native or fluent review required before shipping | Diacritics and terminology |
 | `yo` | Yoruba | Latin | LTR | Follow-up | Planned | `en` | Matrix only; native or fluent review required before shipping | Tone marks and terminology |
 | `fil` | Filipino/Tagalog | Latin | LTR | Follow-up | Planned | `en` | Matrix only; source strings required before shipping | Terminology consistency |
-| `es-419` | Spanish (Latin America) | Latin | LTR | Follow-up | Planned | `en` | Matrix only; reviewer pass required before shipping | Regional terminology |
 | `fr` | French | Latin | LTR | Follow-up | Planned | `en` | Matrix only; reviewer pass required before shipping | African locale terminology varies |
 
 ## Message Coverage

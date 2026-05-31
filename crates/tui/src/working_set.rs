@@ -7,6 +7,9 @@
 //! - pinned message indices that compaction should preserve
 
 use crate::models::{ContentBlock, Message};
+use crate::workspace_discovery::{
+    DISCOVERY_ALWAYS_DIRS, path_is_excluded_from_discovery, should_skip_unignored_discovery_entry,
+};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -93,13 +96,18 @@ impl Workspace {
 
     fn build_file_index(&self) -> HashMap<String, Vec<PathBuf>> {
         let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let mut builder = WalkBuilder::new(&self.root);
-        builder.hidden(true).follow_links(false).max_depth(Some(6));
-        // Honor `.deepseekignore` in addition to the defaults the `ignore` crate
-        // already respects (`.gitignore`, `.git/info/exclude`, `.ignore`).
-        let _ = builder.add_custom_ignore_filename(".deepseekignore");
+        let mut total: usize = 0;
+        let builder = discovery_walk_builder(&self.root, Some(6));
 
         for entry in builder.build().flatten() {
+            if total >= FILE_INDEX_MAX_ENTRIES {
+                tracing::warn!(
+                    target: "working_set",
+                    limit = FILE_INDEX_MAX_ENTRIES,
+                    "file-index discovery hit the entry cap; truncating to keep first-turn latency bounded (#697)"
+                );
+                return index;
+            }
             if entry
                 .file_type()
                 .is_some_and(|ft| ft.is_file() || ft.is_dir())
@@ -109,7 +117,64 @@ impl Workspace {
                     .entry(name)
                     .or_default()
                     .push(entry.path().to_path_buf());
+                total += 1;
             }
+        }
+
+        // Also index AI-tool dot-directories with gitignore disabled.
+        for dir_name in DISCOVERY_ALWAYS_DIRS {
+            if total >= FILE_INDEX_MAX_ENTRIES {
+                break;
+            }
+            let dot_dir = self.root.join(dir_name);
+            if !dot_dir.is_dir() {
+                continue;
+            }
+            let mut dot_builder = WalkBuilder::new(&dot_dir);
+            dot_builder
+                .hidden(true)
+                .follow_links(false)
+                .git_ignore(false)
+                .ignore(false)
+                .max_depth(Some(5));
+            for entry in dot_builder.build().flatten() {
+                if total >= FILE_INDEX_MAX_ENTRIES {
+                    break;
+                }
+                // Exclude machine-generated bulk (e.g. .deepseek/snapshots/).
+                if path_is_excluded_from_discovery(&self.root, entry.path()) {
+                    continue;
+                }
+                if entry
+                    .file_type()
+                    .is_some_and(|ft| ft.is_file() || ft.is_dir())
+                {
+                    let name = entry.file_name().to_string_lossy().to_lowercase();
+                    index
+                        .entry(name)
+                        .or_default()
+                        .push(entry.path().to_path_buf());
+                    total += 1;
+                }
+            }
+        }
+
+        // Beyond the curated dot-dir whitelist above, also index any explicit
+        // hidden/ignored path the user might `@`-mention (e.g. a project's
+        // own `.generated/specs/`). `local_reference_paths` walks with
+        // gitignore disabled but still honors `.deepseekignore`.
+        for path in local_reference_paths(&self.root, LOCAL_REFERENCE_SCAN_LIMIT) {
+            if total >= FILE_INDEX_MAX_ENTRIES {
+                break;
+            }
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_lowercase())
+            else {
+                continue;
+            };
+            index.entry(name).or_default().push(path);
+            total += 1;
         }
         index
     }
@@ -156,8 +221,26 @@ impl Workspace {
                 &mut substring_hits,
                 &mut seen,
             );
+            add_local_reference_completions(
+                cwd,
+                cwd,
+                &needle,
+                limit,
+                &mut prefix_hits,
+                &mut substring_hits,
+                &mut seen,
+            );
         }
         walk_for_completions(
+            &self.root,
+            &self.root,
+            &needle,
+            limit,
+            &mut prefix_hits,
+            &mut substring_hits,
+            &mut seen,
+        );
+        add_local_reference_completions(
             &self.root,
             &self.root,
             &needle,
@@ -180,6 +263,94 @@ impl Workspace {
 /// monorepos.
 const COMPLETIONS_WALK_DEPTH: usize = 6;
 
+/// Hard cap on the number of `(file or directory)` entries indexed by
+/// [`Workspace::build_file_index`]. The fuzzy-resolve index is a
+/// convenience for [`Workspace::fuzzy_resolve`]; missing entries fall
+/// back to literal-path resolution. Capping here keeps the first
+/// `fuzzy_resolve` call bounded on huge workspaces (#697 reported a
+/// ~10s hang on the first turn). For typical projects 50K is well
+/// above the actual entry count and the cap is a no-op.
+const FILE_INDEX_MAX_ENTRIES: usize = 50_000;
+
+/// Configure a `WalkBuilder` for workspace discovery: hidden files, no
+/// symlink following, depth-limited, custom `.deepseekignore` honored,
+/// and gitignore overrides for AI-tool dot-directories so `@`-completion
+/// finds them even when they're gitignored.
+fn discovery_walk_builder(root: &Path, max_depth: Option<usize>) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(true).follow_links(false);
+    if let Some(depth) = max_depth {
+        builder.max_depth(Some(depth));
+    }
+    let _ = builder.add_custom_ignore_filename(".deepseekignore");
+    builder
+}
+
+/// Walk the AI-tool dot-directories (`.deepseek/`, `.cursor/`, `.claude/`,
+/// `.agents/`) with gitignore disabled so their contents are discoverable
+/// even when the project's `.gitignore` / `.ignore` excludes them.
+#[allow(clippy::too_many_arguments)]
+fn walk_always_discoverable_dirs(
+    walk_root: &Path,
+    display_root: &Path,
+    needle: &str,
+    limit: usize,
+    prefix_hits: &mut Vec<String>,
+    substring_hits: &mut Vec<String>,
+    seen: &mut HashSet<PathBuf>,
+    max_depth: Option<usize>,
+) {
+    for dir_name in DISCOVERY_ALWAYS_DIRS {
+        let dot_dir = walk_root.join(dir_name);
+        if !dot_dir.is_dir() {
+            continue;
+        }
+        let mut builder = WalkBuilder::new(&dot_dir);
+        builder
+            .hidden(true)
+            .follow_links(false)
+            .git_ignore(false)
+            .ignore(false);
+        if let Some(depth) = max_depth {
+            builder.max_depth(Some(depth.saturating_sub(1)));
+        }
+        for entry in builder.build().flatten() {
+            if prefix_hits.len() + substring_hits.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            // Exclude machine-generated bulk (e.g. .deepseek/snapshots/)
+            // even though gitignore is disabled for this walk.
+            if path_is_excluded_from_discovery(walk_root, path) {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(display_root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if rel_str.is_empty() {
+                continue;
+            }
+            let abs = path.to_path_buf();
+            if !seen.insert(abs) {
+                continue;
+            }
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            let candidate = if is_dir {
+                format!("{rel_str}/")
+            } else {
+                rel_str.clone()
+            };
+            let lower = candidate.to_lowercase();
+            if needle.is_empty() || lower.starts_with(needle) {
+                prefix_hits.push(candidate);
+            } else if lower.contains(needle) {
+                substring_hits.push(candidate);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_for_completions(
     walk_root: &Path,
@@ -190,12 +361,7 @@ fn walk_for_completions(
     substring_hits: &mut Vec<String>,
     seen: &mut HashSet<PathBuf>,
 ) {
-    let mut builder = WalkBuilder::new(walk_root);
-    builder
-        .hidden(true)
-        .follow_links(false)
-        .max_depth(Some(COMPLETIONS_WALK_DEPTH));
-    let _ = builder.add_custom_ignore_filename(".deepseekignore");
+    let builder = discovery_walk_builder(walk_root, Some(COMPLETIONS_WALK_DEPTH));
 
     for entry in builder.build().flatten() {
         if prefix_hits.len() + substring_hits.len() >= limit {
@@ -228,6 +394,104 @@ fn walk_for_completions(
             substring_hits.push(candidate);
         }
     }
+
+    // Also walk the AI-tool dot-directories with gitignore disabled so
+    // `.deepseek/`, `.cursor/`, etc. are always discoverable.
+    walk_always_discoverable_dirs(
+        walk_root,
+        display_root,
+        needle,
+        limit,
+        prefix_hits,
+        substring_hits,
+        seen,
+        Some(COMPLETIONS_WALK_DEPTH),
+    );
+}
+
+const LOCAL_REFERENCE_SCAN_LIMIT: usize = 4096;
+
+#[allow(clippy::too_many_arguments)]
+fn add_local_reference_completions(
+    root: &Path,
+    display_root: &Path,
+    needle: &str,
+    limit: usize,
+    prefix_hits: &mut Vec<String>,
+    substring_hits: &mut Vec<String>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if !should_try_local_reference_completion(needle) {
+        return;
+    }
+
+    for path in local_reference_paths(root, LOCAL_REFERENCE_SCAN_LIMIT) {
+        if prefix_hits.len() + substring_hits.len() >= limit {
+            break;
+        }
+        let Ok(rel) = path.strip_prefix(display_root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.is_empty() || !seen.insert(path.clone()) {
+            continue;
+        }
+        let lower = rel_str.to_lowercase();
+        if needle.is_empty() || lower.starts_with(needle) {
+            prefix_hits.push(rel_str);
+        } else if lower.contains(needle) {
+            substring_hits.push(rel_str);
+        }
+    }
+}
+
+fn should_try_local_reference_completion(needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    // A bare separator or dot isn't an actionable path yet. Without this
+    // guard, a single `@/` keystroke triggers a `LOCAL_REFERENCE_SCAN_LIMIT`
+    // (4096-path) walk on the UI thread for #1921 — on WSL2 with a
+    // `/mnt/c/...` workspace each entry crosses Windows-host I/O and the
+    // composer appears frozen for seconds to minutes.
+    if matches!(needle, "/" | "\\" | "." | "..") {
+        return false;
+    }
+    needle.starts_with('.') || needle.contains('/') || needle.contains('\\')
+}
+
+fn local_reference_paths(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .max_depth(Some(COMPLETIONS_WALK_DEPTH))
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false);
+    let _ = builder.add_custom_ignore_filename(".deepseekignore");
+    let root_for_filter = root.to_path_buf();
+    builder.filter_entry(move |entry| {
+        !should_skip_unignored_discovery_entry(&root_for_filter, entry.path())
+    });
+
+    for entry in builder.build().flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        if entry
+            .file_type()
+            .is_some_and(|ft| ft.is_file() || ft.is_dir())
+        {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
 }
 
 impl Clone for Workspace {
@@ -1179,6 +1443,152 @@ mod tests {
     }
 
     #[test]
+    fn workspace_completions_surface_explicit_hidden_and_ignored_paths() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), ".deepseek/\n.generated/\n").unwrap();
+        std::fs::write(
+            tmp.path().join(".deepseekignore"),
+            ".generated/specs/secrets.env\n",
+        )
+        .unwrap();
+        let deepseek_commands = tmp.path().join(".deepseek").join("commands");
+        let generated_specs = tmp.path().join(".generated").join("specs");
+        std::fs::create_dir_all(&deepseek_commands).unwrap();
+        std::fs::create_dir_all(&generated_specs).unwrap();
+        std::fs::write(deepseek_commands.join("start-task.md"), "start").unwrap();
+        std::fs::write(generated_specs.join("device-layout.md"), "layout").unwrap();
+        std::fs::write(generated_specs.join("secrets.env"), "secret").unwrap();
+
+        let ws = Workspace::with_cwd(tmp.path().to_path_buf(), Some(tmp.path().to_path_buf()));
+
+        let start_entries = ws.completions(".deepseek/commands", 16);
+        assert!(
+            start_entries
+                .iter()
+                .any(|e| e == ".deepseek/commands/start-task.md"),
+            "expected explicitly addressed hidden command file in completions: {start_entries:?}",
+        );
+
+        let generated_entries = ws.completions(".generated/specs", 16);
+        assert!(
+            generated_entries
+                .iter()
+                .any(|e| e == ".generated/specs/device-layout.md"),
+            "expected explicitly addressed ignored user folder in completions: {generated_entries:?}",
+        );
+        assert!(
+            !generated_entries
+                .iter()
+                .any(|e| e == ".generated/specs/secrets.env"),
+            ".deepseekignore entries must not be reintroduced by local fallback: {generated_entries:?}",
+        );
+    }
+
+    #[test]
+    fn workspace_completions_skip_hidden_worktrees_and_build_bulk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), ".worktrees/\n.generated/\n").unwrap();
+
+        std::fs::create_dir_all(root.join(".worktrees/release/src")).unwrap();
+        std::fs::write(
+            root.join(".worktrees/release/src/worktree-only.rs"),
+            "fn main() {}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".worktrees/release/target/debug")).unwrap();
+        std::fs::write(
+            root.join(".worktrees/release/target/debug/generated.o"),
+            "object",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join(".claude/worktrees/agent/src")).unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/agent/src/agent-only.md"),
+            "agent note",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/keep.md"), "command").unwrap();
+
+        std::fs::create_dir_all(root.join(".generated/specs")).unwrap();
+        std::fs::write(root.join(".generated/specs/device-layout.md"), "layout").unwrap();
+
+        let ws = Workspace::with_cwd(root.to_path_buf(), Some(root.to_path_buf()));
+
+        let worktree_entries = ws.completions(".worktrees", 32);
+        assert!(
+            worktree_entries
+                .iter()
+                .all(|entry| !entry.starts_with(".worktrees/")),
+            "hidden release worktrees must stay out of completions: {worktree_entries:?}",
+        );
+
+        let claude_worktree_entries = ws.completions(".claude/worktrees", 32);
+        assert!(
+            claude_worktree_entries
+                .iter()
+                .all(|entry| !entry.starts_with(".claude/worktrees/")),
+            ".claude/worktrees must stay out of completions: {claude_worktree_entries:?}",
+        );
+
+        let generated_entries = ws.completions(".generated/specs", 32);
+        assert!(
+            generated_entries
+                .iter()
+                .any(|entry| entry == ".generated/specs/device-layout.md"),
+            "explicit user-generated hidden folders should still complete: {generated_entries:?}",
+        );
+
+        let command_entries = ws.completions(".claude/commands", 32);
+        assert!(
+            command_entries
+                .iter()
+                .any(|entry| entry == ".claude/commands/keep.md"),
+            "normal .claude command files should still complete: {command_entries:?}",
+        );
+
+        assert!(
+            ws.resolve("worktree-only.rs").is_err(),
+            "fuzzy resolution must not index files from hidden release worktrees"
+        );
+        assert!(
+            ws.resolve("agent-only.md").is_err(),
+            "fuzzy resolution must not index files from .claude/worktrees"
+        );
+        assert!(ws.resolve("keep.md").is_ok());
+    }
+
+    #[test]
+    fn fuzzy_index_resolves_hidden_and_ignored_files_except_deepseekignored() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), ".generated/\n").unwrap();
+        std::fs::write(
+            tmp.path().join(".deepseekignore"),
+            ".generated/specs/secrets.env\n",
+        )
+        .unwrap();
+        let generated_specs = tmp.path().join(".generated").join("specs");
+        std::fs::create_dir_all(&generated_specs).unwrap();
+        std::fs::write(generated_specs.join("device-layout.md"), "layout").unwrap();
+        std::fs::write(generated_specs.join("secrets.env"), "secret").unwrap();
+
+        let ws = Workspace::with_cwd(tmp.path().to_path_buf(), None);
+        let resolved = ws.resolve("device-layout.md").unwrap();
+
+        assert!(resolved.ends_with(".generated/specs/device-layout.md"));
+        assert!(
+            ws.resolve("secrets.env").is_err(),
+            "basename fuzzy resolution must honor .deepseekignore"
+        );
+        assert!(
+            ws.resolve(".generated/specs/secrets.env").is_ok(),
+            "exact user-specified paths should still resolve"
+        );
+    }
+
+    #[test]
     fn fuzzy_index_finds_files_and_directories() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("a/b/target_dir")).unwrap();
@@ -1194,5 +1604,171 @@ mod tests {
 
         // Index was populated exactly once (subsequent lookups reuse it).
         assert!(ws.file_index.get().is_some());
+    }
+
+    /// Regression: `@`-mention completion must discover files inside
+    /// `.deepseek/`, `.cursor/`, `.claude/`, `.agents/` even when
+    /// those directories are excluded by `.gitignore` (or `.ignore`).
+    /// The `discovery_walk_builder` override un-ignores them.
+    #[test]
+    fn completions_discovers_files_inside_gitignored_dot_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // `.ignore` works even outside a git repo; use it to simulate
+        // a project that gitignores its AI-tool dot-directories.
+        std::fs::write(
+            root.join(".ignore"),
+            ".deepseek/\n.cursor/\n.claude/\n.agents/\n",
+        )
+        .unwrap();
+
+        // Create files inside each dot-dir.
+        std::fs::create_dir_all(root.join(".deepseek/commands")).unwrap();
+        std::fs::write(root.join(".deepseek/commands/build.md"), "build cmd").unwrap();
+        std::fs::create_dir_all(root.join(".cursor/commands")).unwrap();
+        std::fs::write(root.join(".cursor/commands/run.md"), "run cmd").unwrap();
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/test.md"), "test cmd").unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills/example")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/example/SKILL.md"),
+            "name: example\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::with_cwd(root.to_path_buf(), None);
+
+        // Completions should find entries inside the dot-dirs.
+        {
+            let entries = ws.completions("build", 16);
+            assert!(
+                entries.iter().any(|e| e.contains("build.md")),
+                "expected build.md in completions although .deepseek/ is ignored; got: {entries:?}"
+            );
+        }
+        {
+            let entries = ws.completions("run", 16);
+            assert!(
+                entries.iter().any(|e| e.contains("run.md")),
+                "expected run.md from .cursor/; got: {entries:?}"
+            );
+        }
+        {
+            let entries = ws.completions("test", 16);
+            assert!(
+                entries.iter().any(|e| e.contains("test.md")),
+                "expected test.md from .claude/; got: {entries:?}"
+            );
+        }
+
+        // Fuzzy resolution should also work.
+        let f = ws.resolve("build.md").unwrap();
+        assert!(f.ends_with("build.md"));
+        let f2 = ws.resolve("SKILL.md").unwrap();
+        assert!(f2.ends_with("SKILL.md"));
+    }
+
+    /// Regression: the dot-dir walk must NOT index `.deepseek/snapshots/`,
+    /// which is the snapshot side repo that can grow to hundreds of GB.
+    /// Indexing it would re-create the same OOM/hang that #1112 was built
+    /// to prevent.
+    #[test]
+    fn dot_dir_walk_excludes_snapshot_side_repo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Create a snapshot-like directory tree.
+        std::fs::create_dir_all(root.join(".deepseek/snapshots/deadbeef/deadbeef/.git/objects"))
+            .unwrap();
+        std::fs::write(
+            root.join(".deepseek/snapshots/deadbeef/deadbeef/.git/objects/snapshot.pack"),
+            b"fake pack data",
+        )
+        .unwrap();
+        // Also create a legitimate file in .deepseek/ that should be found.
+        std::fs::create_dir_all(root.join(".deepseek/commands")).unwrap();
+        std::fs::write(root.join(".deepseek/commands/build.md"), "build cmd").unwrap();
+
+        let ws = Workspace::with_cwd(root.to_path_buf(), None);
+
+        // Searching for "build" must find build.md.
+        let entries = ws.completions("build", 16);
+        assert!(
+            entries.iter().any(|e| e.contains("build.md")),
+            "build.md must still be found; got: {entries:?}"
+        );
+        // Searching for "snapshot" must NOT return snapshot files.
+        let snap_entries = ws.completions("snapshot", 16);
+        assert!(
+            !snap_entries.iter().any(|e| e.contains("snapshot")),
+            "snapshot files must NOT appear in completions; got: {snap_entries:?}"
+        );
+
+        // Fuzzy index must also exclude snapshots.
+        let f = ws.resolve("build.md").unwrap();
+        assert!(f.ends_with("build.md"));
+        // snapshot.pack should NOT resolve.
+        let result = ws.resolve("snapshot.pack");
+        assert!(
+            result.is_err(),
+            "snapshot.pack must not resolve via fuzzy index"
+        );
+    }
+
+    /// Regression for #1921 — typing `@/` (or `@.`) must NOT trigger the
+    /// `local_reference_paths` walk, which scans up to
+    /// `LOCAL_REFERENCE_SCAN_LIMIT` paths on the UI thread. On WSL2 with a
+    /// `/mnt/c/...` workspace this hangs the composer for seconds to minutes.
+    #[test]
+    fn should_try_local_reference_completion_skips_bare_separators_and_dots() {
+        // The trigger gate must reject bare separators/dots.
+        assert!(!should_try_local_reference_completion("/"));
+        assert!(!should_try_local_reference_completion("\\"));
+        assert!(!should_try_local_reference_completion("."));
+        assert!(!should_try_local_reference_completion(".."));
+        // Empty string was already rejected; keep that.
+        assert!(!should_try_local_reference_completion(""));
+
+        // Actionable references must still trigger.
+        assert!(should_try_local_reference_completion("./foo"));
+        assert!(should_try_local_reference_completion("../bar"));
+        assert!(should_try_local_reference_completion(".env"));
+        assert!(should_try_local_reference_completion("path/"));
+        assert!(should_try_local_reference_completion("path/to/file"));
+        assert!(should_try_local_reference_completion("/usr"));
+    }
+
+    /// Regression for #1921 — `completions("/", N)` must return without
+    /// invoking `local_reference_paths`, even on a workspace large enough
+    /// to expose the original 4096-path walk. We can't assert "doesn't
+    /// touch the disk", but we can assert the call completes promptly and
+    /// stays within the requested limit.
+    #[test]
+    fn completions_for_bare_slash_does_not_trigger_local_reference_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Lay out enough files that a runaway walk would be visibly slow,
+        // but the bounded path returns near-instantly. Depth-1 entries are
+        // enough; we don't need to stress the filesystem.
+        for i in 0..40 {
+            std::fs::write(root.join(format!("file_{i}.txt")), "x").unwrap();
+        }
+        let ws = Workspace::with_cwd(root.to_path_buf(), None);
+
+        let start = std::time::Instant::now();
+        let entries = ws.completions("/", 64);
+        let elapsed = start.elapsed();
+
+        // Behavioral assertions:
+        // 1. The call returns within a generous bound. Real freezes on
+        //    WSL2 were tens of seconds; a 2s budget is comfortable for a
+        //    40-file tmp dir on any CI host.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "completions(\"/\") took too long: {elapsed:?} (likely re-introduced #1921)"
+        );
+        // 2. Results stay within the requested cap.
+        assert!(entries.len() <= 64);
     }
 }

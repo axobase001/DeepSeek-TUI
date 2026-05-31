@@ -3,26 +3,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use deepseek_agent::ModelRegistry;
-use deepseek_config::{CliRuntimeOverrides, ConfigToml, ProviderKind};
-use deepseek_execpolicy::{
+use codewhale_agent::ModelRegistry;
+use codewhale_config::{CliRuntimeOverrides, ConfigToml, ProviderKind};
+use codewhale_execpolicy::{
     AskForApproval, ExecApprovalRequirement, ExecPolicyContext, ExecPolicyDecision,
     ExecPolicyEngine,
 };
-use deepseek_hooks::{HookDispatcher, HookEvent};
-use deepseek_mcp::{
+use codewhale_hooks::{HookDispatcher, HookEvent};
+use codewhale_mcp::{
     McpManager, McpStartupCompleteEvent, McpStartupStatus as McpManagerStartupStatus,
 };
-use deepseek_protocol::{
+use codewhale_protocol::{
     AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ReviewDecision, Thread, ThreadForkParams, ThreadListParams, ThreadReadParams, ThreadRequest,
-    ThreadResponse, ThreadResumeParams, ThreadSetNameParams, ThreadStatus, ToolPayload,
+    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadListParams, ThreadReadParams,
+    ThreadRequest, ThreadResponse, ThreadResumeParams, ThreadSetNameParams, ThreadStatus,
+    ToolPayload,
 };
-use deepseek_state::{
+use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadListFilters, ThreadMetadata,
     ThreadStatus as PersistedThreadStatus,
 };
-use deepseek_tools::{ToolCall, ToolRegistry};
+use codewhale_tools::{ToolCall, ToolRegistry};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -292,7 +293,7 @@ impl JobManager {
 
     pub fn list(&self) -> Vec<JobRecord> {
         let mut out = self.jobs.values().cloned().collect::<Vec<_>>();
-        out.sort_by_key(|job| -job.updated_at);
+        out.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
         out
     }
 
@@ -319,7 +320,7 @@ impl JobManager {
     pub fn load_from_store(&mut self, store: &StateStore) -> Result<()> {
         let persisted = store.list_jobs(Some(500))?;
         for job in persisted {
-            let fallback_status = job_state_status_to_runtime(job.status.clone());
+            let fallback_status = job_state_status_to_runtime(job.status);
             let parsed = Self::parse_persisted_detail(job.detail.as_deref());
             let (status, detail, retry, history) = if let Some(detail_state) = parsed {
                 (
@@ -424,11 +425,11 @@ impl ThreadManager {
             cwd: cwd.clone(),
             cli_version: self.cli_version.clone(),
             source: match source {
-                SessionSource::Interactive => deepseek_protocol::SessionSource::Interactive,
-                SessionSource::Resume => deepseek_protocol::SessionSource::Resume,
-                SessionSource::Fork => deepseek_protocol::SessionSource::Fork,
-                SessionSource::Api => deepseek_protocol::SessionSource::Api,
-                SessionSource::Unknown => deepseek_protocol::SessionSource::Unknown,
+                SessionSource::Interactive => codewhale_protocol::SessionSource::Interactive,
+                SessionSource::Resume => codewhale_protocol::SessionSource::Resume,
+                SessionSource::Fork => codewhale_protocol::SessionSource::Fork,
+                SessionSource::Api => codewhale_protocol::SessionSource::Api,
+                SessionSource::Unknown => codewhale_protocol::SessionSource::Unknown,
             },
             name: None,
         };
@@ -642,6 +643,7 @@ impl ThreadManager {
             git_branch: None,
             git_origin_url: None,
             memory_mode: None,
+            current_leaf_id: None,
         })
     }
 }
@@ -913,6 +915,7 @@ impl Runtime {
                         EventFrame::ResponseDelta {
                             response_id: response_id.clone(),
                             delta: "queued".to_string(),
+                            channel: ResponseChannel::Text,
                         },
                         EventFrame::ResponseEnd { response_id },
                     ],
@@ -992,6 +995,7 @@ impl Runtime {
                 EventFrame::ResponseDelta {
                     response_id: response_id.clone(),
                     delta: "model-selected".to_string(),
+                    channel: ResponseChannel::Text,
                 },
                 EventFrame::ResponseEnd { response_id },
             ],
@@ -1193,19 +1197,19 @@ impl Runtime {
         });
         for update in updates {
             let status = match update.status {
-                McpManagerStartupStatus::Starting => deepseek_protocol::McpStartupStatus::Starting,
-                McpManagerStartupStatus::Ready => deepseek_protocol::McpStartupStatus::Ready,
+                McpManagerStartupStatus::Starting => codewhale_protocol::McpStartupStatus::Starting,
+                McpManagerStartupStatus::Ready => codewhale_protocol::McpStartupStatus::Ready,
                 McpManagerStartupStatus::Failed { error } => {
-                    deepseek_protocol::McpStartupStatus::Failed { error }
+                    codewhale_protocol::McpStartupStatus::Failed { error }
                 }
                 McpManagerStartupStatus::Cancelled => {
-                    deepseek_protocol::McpStartupStatus::Cancelled
+                    codewhale_protocol::McpStartupStatus::Cancelled
                 }
             };
             self.hooks
                 .emit(HookEvent::GenericEventFrame {
                     frame: EventFrame::McpStartupUpdate {
-                        update: deepseek_protocol::McpStartupUpdateEvent {
+                        update: codewhale_protocol::McpStartupUpdateEvent {
                             server_name: update.server_name,
                             status,
                         },
@@ -1216,12 +1220,12 @@ impl Runtime {
         self.hooks
             .emit(HookEvent::GenericEventFrame {
                 frame: EventFrame::McpStartupComplete {
-                    summary: deepseek_protocol::McpStartupCompleteEvent {
+                    summary: codewhale_protocol::McpStartupCompleteEvent {
                         ready: summary.ready.clone(),
                         failed: summary
                             .failed
                             .iter()
-                            .map(|f| deepseek_protocol::McpStartupFailure {
+                            .map(|f| codewhale_protocol::McpStartupFailure {
                                 server_name: f.server_name.clone(),
                                 error: f.error.clone(),
                             })
@@ -1252,6 +1256,7 @@ impl Runtime {
                         "at": entry.at
                     })
                     .to_string(),
+                    channel: ResponseChannel::Text,
                 })
             })
             .collect::<Vec<_>>();
@@ -1418,11 +1423,11 @@ fn to_protocol_thread(thread: ThreadMetadata) -> Thread {
         cwd: thread.cwd,
         cli_version: thread.cli_version,
         source: match thread.source {
-            SessionSource::Interactive => deepseek_protocol::SessionSource::Interactive,
-            SessionSource::Resume => deepseek_protocol::SessionSource::Resume,
-            SessionSource::Fork => deepseek_protocol::SessionSource::Fork,
-            SessionSource::Api => deepseek_protocol::SessionSource::Api,
-            SessionSource::Unknown => deepseek_protocol::SessionSource::Unknown,
+            SessionSource::Interactive => codewhale_protocol::SessionSource::Interactive,
+            SessionSource::Resume => codewhale_protocol::SessionSource::Resume,
+            SessionSource::Fork => codewhale_protocol::SessionSource::Fork,
+            SessionSource::Api => codewhale_protocol::SessionSource::Api,
+            SessionSource::Unknown => codewhale_protocol::SessionSource::Unknown,
         },
         name: thread.name,
     }
@@ -1439,13 +1444,13 @@ fn to_persisted_status(status: &ThreadStatus) -> PersistedThreadStatus {
     }
 }
 
-fn to_persisted_source(source: &deepseek_protocol::SessionSource) -> SessionSource {
+fn to_persisted_source(source: &codewhale_protocol::SessionSource) -> SessionSource {
     match source {
-        deepseek_protocol::SessionSource::Interactive => SessionSource::Interactive,
-        deepseek_protocol::SessionSource::Resume => SessionSource::Resume,
-        deepseek_protocol::SessionSource::Fork => SessionSource::Fork,
-        deepseek_protocol::SessionSource::Api => SessionSource::Api,
-        deepseek_protocol::SessionSource::Unknown => SessionSource::Unknown,
+        codewhale_protocol::SessionSource::Interactive => SessionSource::Interactive,
+        codewhale_protocol::SessionSource::Resume => SessionSource::Resume,
+        codewhale_protocol::SessionSource::Fork => SessionSource::Fork,
+        codewhale_protocol::SessionSource::Api => SessionSource::Api,
+        codewhale_protocol::SessionSource::Unknown => SessionSource::Unknown,
     }
 }
 
@@ -1564,7 +1569,7 @@ fn tool_payload_value(payload: &ToolPayload) -> Value {
     )
 }
 
-fn tool_output_value(output: &deepseek_protocol::ToolOutput) -> Value {
+fn tool_output_value(output: &codewhale_protocol::ToolOutput) -> Value {
     serde_json::to_value(output).unwrap_or_else(
         |_| json!({"type":"serialization_error","message":"tool output unavailable"}),
     )

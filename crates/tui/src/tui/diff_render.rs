@@ -2,7 +2,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
 
@@ -54,7 +54,9 @@ pub fn render_diff(diff: &str, width: u16) -> Vec<Line<'static>> {
                 old_line,
                 new_line,
                 '+',
-                Style::default().fg(palette::STATUS_SUCCESS),
+                Style::default()
+                    .fg(palette::DIFF_ADDED)
+                    .bg(palette::DIFF_ADDED_BG),
             ));
             if let Some(line) = new_line.as_mut() {
                 *line = line.saturating_add(1);
@@ -70,7 +72,9 @@ pub fn render_diff(diff: &str, width: u16) -> Vec<Line<'static>> {
                 old_line,
                 new_line,
                 '-',
-                Style::default().fg(palette::STATUS_ERROR),
+                Style::default()
+                    .fg(palette::STATUS_ERROR)
+                    .bg(palette::DIFF_DELETED_BG),
             ));
             if let Some(line) = old_line.as_mut() {
                 *line = line.saturating_add(1);
@@ -314,20 +318,10 @@ fn render_diff_line(
 
 fn format_line_numbers(old_line: Option<usize>, new_line: Option<usize>, marker: char) -> String {
     let old = old_line
-        .map(|value| {
-            format!(
-                "{value:>LINE_NUMBER_WIDTH$}",
-                LINE_NUMBER_WIDTH = LINE_NUMBER_WIDTH
-            )
-        })
+        .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     let new = new_line
-        .map(|value| {
-            format!(
-                "{value:>LINE_NUMBER_WIDTH$}",
-                LINE_NUMBER_WIDTH = LINE_NUMBER_WIDTH
-            )
-        })
+        .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     format!("{old} {new} {marker} ")
 }
@@ -353,6 +347,14 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
     for word in text.split_whitespace() {
         let word_width = word.width();
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            continue;
+        }
         let additional = if current.is_empty() {
             word_width
         } else {
@@ -379,6 +381,24 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+fn push_word_breaking_chars(
+    word: &str,
+    width: usize,
+    current: &mut String,
+    current_width: &mut usize,
+    lines: &mut Vec<String>,
+) {
+    for ch in word.chars() {
+        let char_width = ch.width().unwrap_or(1);
+        if *current_width + char_width > width && *current_width > 0 {
+            lines.push(std::mem::take(current));
+            *current_width = 0;
+        }
+        current.push(ch);
+        *current_width += char_width;
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +465,17 @@ diff --git a/src/a.rs b/src/a.rs
             text.iter().any(|line| line.contains(" - old")),
             "deleted line should carry - gutter: {text:?}"
         );
+    }
+
+    #[test]
+    fn wrap_text_breaks_overlong_cjk_runs() {
+        let text = "这是一个非常长的中文字符串".repeat(10);
+        let lines = wrap_text(&text, 16);
+
+        for line in &lines {
+            assert!(line.width() <= 16, "line {line:?} exceeds width 16");
+        }
+
+        assert_eq!(lines.join(""), text);
     }
 }

@@ -162,11 +162,10 @@ fn archive_root(session_id: &str) -> Result<PathBuf, std::io::Error> {
             "Could not resolve home directory for cycle archive root",
         )
     })?;
-    Ok(home
-        .join(".deepseek")
-        .join("sessions")
-        .join(session_id)
-        .join("cycles"))
+    // Use resolved sessions dir (prefers ~/.codewhale/sessions)
+    let sessions = codewhale_config::resolve_state_dir("sessions")
+        .unwrap_or_else(|_| home.join(".deepseek").join("sessions"));
+    Ok(sessions.join(session_id).join("cycles"))
 }
 
 /// Enumerate all archive files for a session, sorted by cycle number ascending.
@@ -428,14 +427,10 @@ mod tests {
         }
     }
 
-    /// Serializes home-redirecting tests since cargo runs tests in parallel
-    /// by default. Held for the full test (no `.await` while holding it).
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Guard that points `dirs::home_dir()` at a tempdir for the test's
     /// lifetime and restores the original on drop. On Unix this means
     /// `HOME`; on Windows it means `USERPROFILE`. We set both so the same
-    /// guard works portably. Holds `HOME_LOCK` to serialize.
+    /// guard works portably. Holds process-wide lock to serialize.
     struct HomeGuard {
         _tmp: TempDir,
         original_home: Option<String>,
@@ -444,11 +439,11 @@ mod tests {
     }
     impl HomeGuard {
         fn new() -> Self {
-            let lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let lock = crate::test_support::lock_test_env();
             let tmp = TempDir::new().expect("tempdir");
             let original_home = std::env::var("HOME").ok();
             let original_userprofile = std::env::var("USERPROFILE").ok();
-            // SAFETY: serialized by HOME_LOCK; only this thread mutates the
+            // SAFETY: serialized by process-wide lock; only this thread mutates the
             // env vars for the duration of the guard.
             unsafe {
                 std::env::set_var("HOME", tmp.path());

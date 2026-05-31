@@ -1,4 +1,4 @@
-//! Tool specification traits for the DeepSeek TUI agent system.
+//! Tool specification traits for the CodeWhale agent system.
 //!
 //! This module defines the core abstractions for tools:
 //! - `ToolSpec`: The main trait that all tools must implement
@@ -16,10 +16,13 @@ use tokio_util::sync::CancellationToken;
 use crate::features::Features;
 use crate::lsp::LspManager;
 use crate::network_policy::NetworkPolicyDecider;
+use crate::rlm::session::SessionObjectSnapshot;
+use crate::rlm::session::{SharedRlmSessionStore, new_shared_rlm_session_store};
 use crate::sandbox::backend::SandboxBackend;
+use crate::tools::handle::{SharedHandleStore, new_shared_handle_store};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 #[allow(unused_imports)]
-pub use deepseek_tools::{
+pub use codewhale_tools::{
     ApprovalRequirement, ToolCapability, ToolError, ToolResult, optional_bool, optional_str,
     optional_u64, required_str, required_u64,
 };
@@ -30,7 +33,7 @@ pub use deepseek_tools::{
 /// contexts keep working. Tools that need durable task/automation state fail
 /// closed with a clear "not available" error when the relevant service is not
 /// attached.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RuntimeToolServices {
     pub shell_manager: Option<SharedShellManager>,
     pub task_manager: Option<crate::task_manager::SharedTaskManager>,
@@ -42,6 +45,27 @@ pub struct RuntimeToolServices {
     /// tool-side hook events. `None` outside the live engine — test
     /// contexts that don't care about hooks get a no-op.
     pub hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
+    /// Per-session backing store for `var_handle` payloads. Cloned tool
+    /// contexts share this Arc so handles survive across turns.
+    pub handle_store: SharedHandleStore,
+    /// Per-session persistent RLM kernels, keyed by caller-chosen context name.
+    pub rlm_sessions: SharedRlmSessionStore,
+}
+
+impl Default for RuntimeToolServices {
+    fn default() -> Self {
+        Self {
+            shell_manager: None,
+            task_manager: None,
+            automations: None,
+            task_data_dir: None,
+            active_task_id: None,
+            active_thread_id: None,
+            hook_executor: None,
+            handle_store: new_shared_handle_store(),
+            rlm_sessions: new_shared_rlm_session_store(),
+        }
+    }
 }
 
 impl std::fmt::Debug for RuntimeToolServices {
@@ -54,6 +78,8 @@ impl std::fmt::Debug for RuntimeToolServices {
             .field("active_task_id", &self.active_task_id)
             .field("active_thread_id", &self.active_thread_id)
             .field("hook_executor", &self.hook_executor.is_some())
+            .field("handle_store", &true)
+            .field("rlm_sessions", &true)
             .finish()
     }
 }
@@ -86,6 +112,9 @@ pub struct ToolContext {
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
     /// This overrides the default sandbox behavior for shell commands.
     pub elevated_sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
+    /// Optional user-facing hint for shell commands that fail because the
+    /// active sandbox policy intentionally denies outbound network access.
+    pub shell_network_denied_hint: Option<String>,
     /// Whether tools should auto-approve without safety checks (YOLO mode).
     /// When true, command safety analysis is skipped for shell execution.
     pub auto_approve: bool,
@@ -105,6 +134,10 @@ pub struct ToolContext {
     /// Durable runtime services for task, gate, PR-attempt, GitHub evidence,
     /// and automation tools.
     pub runtime: RuntimeToolServices,
+    /// Snapshot of the active prompt/session/history exposed as symbolic RLM
+    /// objects. Tools only receive compact cards unless explicitly opening a
+    /// bounded object through `rlm_open`.
+    pub session_objects: Option<SessionObjectSnapshot>,
     /// Cancellation token for the active engine turn. Tools that may wait on
     /// external work should observe this so UI cancel can interrupt them.
     pub cancel_token: Option<CancellationToken>,
@@ -129,6 +162,14 @@ pub struct ToolContext {
     /// routing (e.g. in sub-agents and test contexts to avoid recursion).
     pub large_output_router: Option<crate::tools::large_output_router::LargeOutputRouter>,
 
+    /// Which search backend `web_search` should use. Default: DuckDuckGo. Set via
+    /// `[search] provider` in config.toml.
+    pub search_provider: crate::config::SearchProvider,
+    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
+    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
+    /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
+    pub search_api_key: Option<String>,
+
     /// Per-session workshop variable store (#548). Holds the raw content of
     /// the most recent large-tool routing event so the parent can call
     /// `promote_to_context` later. `None` when the router is disabled.
@@ -143,8 +184,9 @@ impl ToolContext {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
         let shell_manager = new_shared_shell_manager(workspace.clone());
-        let notes_path = workspace.join(".deepseek").join("notes.md");
-        let mcp_config_path = workspace.join(".deepseek").join("mcp.json");
+        // Prefer .codewhale, fall back to .deepseek for project-local state
+        let notes_path = codewhale_config::resolve_project_state_dir(&workspace, "notes.md").1;
+        let mcp_config_path = codewhale_config::resolve_project_state_dir(&workspace, "mcp.json").1;
         Self {
             workspace,
             shell_manager,
@@ -153,17 +195,21 @@ impl ToolContext {
             notes_path,
             mcp_config_path,
             elevated_sandbox_policy: None,
+            shell_network_denied_hint: None,
             auto_approve: false,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
             trusted_external_paths: Vec::new(),
             network_policy: None,
             runtime: RuntimeToolServices::default(),
+            session_objects: None,
             cancel_token: None,
             sandbox_backend: None,
             memory_path: None,
             lsp_manager: None,
             large_output_router: None,
+            search_provider: crate::config::SearchProvider::default(),
+            search_api_key: None,
             workshop_vars: None,
         }
     }
@@ -186,17 +232,21 @@ impl ToolContext {
             notes_path: notes_path.into(),
             mcp_config_path: mcp_config_path.into(),
             elevated_sandbox_policy: None,
+            shell_network_denied_hint: None,
             auto_approve: false,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
             trusted_external_paths: Vec::new(),
             network_policy: None,
             runtime: RuntimeToolServices::default(),
+            session_objects: None,
             cancel_token: None,
             sandbox_backend: None,
             memory_path: None,
             lsp_manager: None,
             large_output_router: None,
+            search_provider: crate::config::SearchProvider::default(),
+            search_api_key: None,
             workshop_vars: None,
         }
     }
@@ -219,17 +269,21 @@ impl ToolContext {
             notes_path: notes_path.into(),
             mcp_config_path: mcp_config_path.into(),
             elevated_sandbox_policy: None,
+            shell_network_denied_hint: None,
             auto_approve,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
             trusted_external_paths: Vec::new(),
             network_policy: None,
             runtime: RuntimeToolServices::default(),
+            session_objects: None,
             cancel_token: None,
             sandbox_backend: None,
             memory_path: None,
             lsp_manager: None,
             large_output_router: None,
+            search_provider: crate::config::SearchProvider::default(),
+            search_api_key: None,
             workshop_vars: None,
         }
     }
@@ -245,6 +299,13 @@ impl ToolContext {
     #[must_use]
     pub fn with_runtime_services(mut self, runtime: RuntimeToolServices) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Attach active prompt/history/session symbolic objects for RLM tools.
+    #[must_use]
+    pub fn with_session_objects(mut self, snapshot: SessionObjectSnapshot) -> Self {
+        self.session_objects = Some(snapshot);
         self
     }
 
@@ -445,6 +506,12 @@ impl ToolContext {
     /// with elevated permissions.
     pub fn with_elevated_sandbox_policy(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
         self.elevated_sandbox_policy = Some(policy);
+        self
+    }
+
+    /// Set the shell network-denial hint used by network-restricted modes.
+    pub fn with_shell_network_denied_hint(mut self, hint: impl Into<String>) -> Self {
+        self.shell_network_denied_hint = Some(hint.into());
         self
     }
 

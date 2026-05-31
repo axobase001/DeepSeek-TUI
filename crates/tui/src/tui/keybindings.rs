@@ -94,12 +94,17 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
+        chord: "Shift+↑ / Shift+↓",
+        description_id: crate::localization::MessageId::KbBrowseHistory,
+        section: KeybindingSection::Navigation,
+    },
+    KeybindingEntry {
         chord: "PgUp / PgDn",
         description_id: crate::localization::MessageId::KbScrollPage,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "Home / End",
+        chord: "Ctrl+Home / Ctrl+End",
         description_id: crate::localization::MessageId::KbJumpTopBottom,
         section: KeybindingSection::Navigation,
     },
@@ -117,6 +122,11 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     KeybindingEntry {
         chord: "← / →",
         description_id: crate::localization::MessageId::KbMoveCursor,
+        section: KeybindingSection::Editing,
+    },
+    KeybindingEntry {
+        chord: "Home / End",
+        description_id: crate::localization::MessageId::KbJumpLineStartEnd,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
@@ -145,7 +155,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
-        chord: "Ctrl+J / Alt+Enter",
+        chord: "Ctrl+J / Alt+Enter / Shift+Enter",
         description_id: crate::localization::MessageId::KbInsertNewline,
         section: KeybindingSection::Editing,
     },
@@ -237,7 +247,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
-        chord: "Alt+! / Alt+@ / Alt+# / Alt+4 / Alt+$ / Alt+0",
+        chord: "Alt+! / Alt+@ / Alt+# / Alt+$ / Alt+0 / Ctrl+Alt+0",
         description_id: crate::localization::MessageId::KbFocusSidebar,
         section: KeybindingSection::Modes,
     },
@@ -297,7 +307,7 @@ mod tests {
 
     #[test]
     fn catalog_is_non_empty_and_sections_have_entries() {
-        assert!(!KEYBINDINGS.is_empty());
+        assert!(KEYBINDINGS.iter().any(|entry| !entry.chord.is_empty()));
         // Every declared section should appear in the catalog at least once,
         // otherwise the help overlay would render an empty heading.
         let sections = [
@@ -312,8 +322,7 @@ mod tests {
         for section in sections {
             assert!(
                 KEYBINDINGS.iter().any(|entry| entry.section == section),
-                "no entries for section {:?}",
-                section
+                "no entries for section {section:?}"
             );
         }
     }
@@ -327,6 +336,23 @@ mod tests {
                 .iter()
                 .any(|entry| entry.chord.contains('?') && entry.section == KeybindingSection::Help),
             "`?` must remain documented as the help-toggle chord"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_help_copy_matches_activity_detail_behavior() {
+        let ctrl_o = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.chord == "Ctrl+O")
+            .expect("Ctrl+O keybinding should be documented");
+
+        assert_eq!(
+            ctrl_o.description_id,
+            crate::localization::MessageId::KbThinkingPager
+        );
+        assert_eq!(
+            crate::localization::tr(crate::localization::Locale::En, ctrl_o.description_id,),
+            "Open Activity Detail"
         );
     }
 

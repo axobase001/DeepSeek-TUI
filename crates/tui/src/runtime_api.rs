@@ -3,16 +3,18 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fs;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -32,12 +34,13 @@ use crate::automation_manager::{
 use crate::config::{Config, DEFAULT_TEXT_MODEL};
 use crate::mcp::{McpConfig, McpPool};
 use crate::runtime_threads::{
-    CompactThreadRequest, CreateThreadRequest, RuntimeThreadManager, RuntimeThreadManagerConfig,
-    SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
-    ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest, UsageGroupBy,
+    CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision, RuntimeThreadManager,
+    RuntimeThreadManagerConfig, SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest,
+    ThreadDetail, ThreadListFilter, ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest,
+    UsageGroupBy,
 };
 use crate::session_manager::{SavedSession, SessionManager, SessionMetadata, default_sessions_dir};
-use crate::skills::SkillRegistry;
+use crate::skill_state::SkillStateStore;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
 };
@@ -52,6 +55,12 @@ pub struct RuntimeApiState {
     sessions_dir: PathBuf,
     mcp_config_path: PathBuf,
     automations: SharedAutomationManager,
+    runtime_token: Option<String>,
+    skill_state: Arc<Mutex<SkillStateStore>>,
+    auth_required: bool,
+    bind_host: String,
+    bind_port: u16,
+    mobile_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +74,13 @@ pub struct RuntimeApiOptions {
     /// `DEEPSEEK_CORS_ORIGINS` (comma-separated), and `[runtime_api]
     /// cors_origins` in `config.toml`. Whalescale#255 / #561.
     pub cors_origins: Vec<String>,
+    /// Optional bearer token required for `/v1/*` routes. If omitted here,
+    /// `run_http_server` also checks `DEEPSEEK_RUNTIME_TOKEN`.
+    pub auth_token: Option<String>,
+    /// Allow `/v1/*` routes without auth when no token is configured.
+    pub insecure_no_auth: bool,
+    /// Enables the built-in mobile control page at `/mobile`.
+    pub mobile: bool,
 }
 
 impl Default for RuntimeApiOptions {
@@ -74,8 +90,55 @@ impl Default for RuntimeApiOptions {
             port: 7878,
             workers: 2,
             cors_origins: Vec::new(),
+            auth_token: None,
+            insecure_no_auth: false,
+            mobile: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRuntimeAuth {
+    token: Option<String>,
+    generated: bool,
+}
+
+fn resolve_runtime_auth(
+    cli_token: Option<String>,
+    env_token: Option<String>,
+    insecure_no_auth: bool,
+) -> ResolvedRuntimeAuth {
+    if let Some(token) = first_nonblank_token(cli_token).or_else(|| first_nonblank_token(env_token))
+    {
+        return ResolvedRuntimeAuth {
+            token: Some(token),
+            generated: false,
+        };
+    }
+    if insecure_no_auth {
+        return ResolvedRuntimeAuth {
+            token: None,
+            generated: false,
+        };
+    }
+    ResolvedRuntimeAuth {
+        token: Some(generate_runtime_token()),
+        generated: true,
+    }
+}
+
+fn first_nonblank_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn generate_runtime_token() -> String {
+    format!(
+        "dst_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,13 +264,69 @@ struct SkillEntry {
     name: String,
     description: String,
     path: PathBuf,
+    enabled: bool,
+    is_bundled: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct SkillsResponse {
     directory: PathBuf,
+    directories: Vec<PathBuf>,
     warnings: Vec<String>,
     skills: Vec<SkillEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSkillEnabledRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SetSkillEnabledResponse {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideApprovalBody {
+    decision: String,
+    #[serde(default)]
+    remember: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DecideApprovalResponse {
+    ok: bool,
+    approval_id: String,
+    decision: String,
+    delivered: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitUserInputBody {
+    answers: Vec<UserInputAnswerBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInputAnswerBody {
+    id: String,
+    label: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitUserInputResponse {
+    ok: bool,
+    input_id: String,
+    delivered: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeInfoResponse {
+    bind_host: String,
+    port: u16,
+    auth_required: bool,
+    version: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,6 +420,20 @@ pub async fn run_http_server(
             .map(|h| h.join(".deepseek").join("sessions"))
             .unwrap_or_else(|| PathBuf::from(".deepseek").join("sessions"))
     });
+    let resolved_auth = resolve_runtime_auth(
+        options.auth_token.clone(),
+        std::env::var("DEEPSEEK_RUNTIME_TOKEN").ok(),
+        options.insecure_no_auth,
+    );
+    let runtime_token = resolved_auth.token.clone();
+    let auth_enabled = runtime_token.is_some();
+    let skill_state = SkillStateStore::load_default().unwrap_or_else(|err| {
+        tracing::warn!(
+            "Failed to load skills_state.toml ({}); treating all skills as enabled",
+            err
+        );
+        SkillStateStore::default()
+    });
     let state = RuntimeApiState {
         config: config.clone(),
         workspace,
@@ -310,6 +443,12 @@ pub async fn run_http_server(
         sessions_dir,
         mcp_config_path: config.mcp_config_path(),
         automations,
+        runtime_token: runtime_token.clone(),
+        skill_state: Arc::new(Mutex::new(skill_state)),
+        auth_required: auth_enabled,
+        bind_host: options.host.clone(),
+        bind_port: options.port,
+        mobile_enabled: options.mobile,
     };
     let app = build_router(state);
 
@@ -321,7 +460,40 @@ pub async fn run_http_server(
         .with_context(|| format!("Failed to bind {addr}"))?;
 
     println!("Runtime API listening on http://{addr}");
-    println!("Security: this server is local-first. Do not expose it to untrusted networks.");
+    if resolved_auth.generated {
+        if let Some(token) = runtime_token.as_deref() {
+            println!("Runtime API auth: generated bearer token for this process.");
+            println!("  Authorization: Bearer {token}");
+            println!("  Set DEEPSEEK_RUNTIME_TOKEN or pass --auth-token for a stable token.");
+        }
+    } else if auth_enabled {
+        println!("Runtime API auth: bearer token required for /v1/* routes.");
+    } else {
+        println!("Runtime API auth: disabled by explicit insecure mode.");
+    }
+    if options.mobile {
+        print_mobile_urls(addr, runtime_token.as_deref(), auth_enabled);
+    }
+    let is_loopback = options.host == "127.0.0.1" || options.host == "::1";
+    if is_loopback {
+        println!("Security: this server is local-first. Do not expose it to untrusted networks.");
+    } else {
+        println!(
+            "Security: bound to {host}; reachable from any peer that can route to this address.",
+            host = options.host
+        );
+        if !auth_enabled {
+            println!(
+                "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+            );
+        }
+        println!(
+            "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
+            host = options.host,
+            port = options.port,
+            auth = auth_enabled,
+        );
+    }
     let serve_result = axum::serve(listener, app)
         .await
         .map_err(|e| anyhow!("Runtime API server error: {e}"));
@@ -331,8 +503,7 @@ pub async fn run_http_server(
 }
 
 pub fn build_router(state: RuntimeApiState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let api_routes = Router::new()
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route(
@@ -357,10 +528,16 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/compact", post(compact_thread))
         .route("/v1/threads/{id}/events", get(stream_thread_events))
+        .route("/v1/approvals/{approval_id}", post(decide_approval))
+        .route(
+            "/v1/user-input/{thread_id}/{input_id}",
+            post(submit_user_input),
+        )
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
+        .route("/v1/skills/{name}", post(set_skill_enabled))
         .route("/v1/apps/mcp/servers", get(list_mcp_servers))
         .route("/v1/apps/mcp/tools", get(list_mcp_tools))
         .route(
@@ -378,8 +555,168 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/automations/{id}/resume", post(resume_automation))
         .route("/v1/automations/{id}/runs", get(list_automation_runs))
         .route("/v1/usage", get(get_usage))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_runtime_token,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/mobile", get(mobile_page))
+        .route("/mobile/", get(mobile_page))
+        .route("/v1/runtime/info", get(runtime_info))
+        .merge(api_routes)
         .layer(cors_layer(&state.cors_origins))
         .with_state(state)
+}
+
+async fn require_runtime_token(
+    State(state): State<RuntimeApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.runtime_token.as_deref() else {
+        return next.run(req).await;
+    };
+    let authorized = request_has_runtime_token(&req, expected);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        runtime_token_required_response()
+    }
+}
+
+fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected)
+        || req
+            .headers()
+            .get("x-deepseek-runtime-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| token == expected)
+        || token_from_query(req.uri().query()).is_some_and(|token| token == expected)
+}
+
+fn runtime_token_required_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "message": "runtime API bearer token required",
+                "status": StatusCode::UNAUTHORIZED.as_u16(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn token_from_query(query: Option<&str>) -> Option<String> {
+    query.and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "token")
+                .then(|| percent_decode_query_component(value))
+                .flatten()
+        })
+    })
+}
+
+fn percent_decode_query_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hi = *bytes.get(index + 1)?;
+                let lo = *bytes.get(index + 2)?;
+                let hi = (hi as char).to_digit(16)? as u8;
+                let lo = (lo as char).to_digit(16)? as u8;
+                decoded.push((hi << 4) | lo);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Response {
+    if !state.mobile_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            "mobile control is disabled; start with `codewhale serve --mobile`",
+        )
+            .into_response();
+    }
+    if let Some(expected) = state.runtime_token.as_deref()
+        && !request_has_runtime_token(&req, expected)
+    {
+        return runtime_token_required_response();
+    }
+    Html(MOBILE_HTML).into_response()
+}
+
+fn print_mobile_urls(addr: SocketAddr, token: Option<&str>, auth_enabled: bool) {
+    println!("Mobile control page enabled.");
+    let token_query = if auth_enabled {
+        token
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| format!("?token={}", url_query_component(token)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let port = addr.port();
+    if addr.ip().is_unspecified() {
+        println!("  Local: http://127.0.0.1:{port}/mobile{token_query}");
+        if let Some(ip) = detect_lan_ip() {
+            println!("  LAN:   http://{ip}:{port}/mobile{token_query}");
+        } else {
+            println!(
+                "  LAN:   bind is 0.0.0.0; open http://<this-machine-ip>:{port}/mobile{token_query}"
+            );
+        }
+    } else {
+        println!("  URL:   http://{addr}/mobile{token_query}");
+    }
+    println!("Mobile security: use only on a trusted LAN/VPN; this server does not provide TLS.");
+}
+
+fn url_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn detect_lan_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // UDP connect only selects the outbound interface locally; no packet is sent.
+    socket.connect("10.255.255.255:1").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -508,7 +845,38 @@ fn session_to_detail(session: SavedSession) -> SessionDetailResponse {
                     crate::models::ContentBlock::Thinking { thinking, .. } => {
                         json!({ "type": "thinking", "text": thinking })
                     }
-                    _ => json!({ "type": "other" }),
+                    crate::models::ContentBlock::ToolUse { id, name, input, caller } => {
+                        let mut obj =
+                            json!({ "type": "tool_use", "id": id, "name": name, "input": input });
+                        if let Some(caller) = caller {
+                            obj["caller"] = json!(caller);
+                        }
+                        obj
+                    }
+                    crate::models::ContentBlock::ToolResult { tool_use_id, content, is_error, content_blocks, .. } => {
+                        let mut obj = json!({ "type": "tool_result", "tool_use_id": tool_use_id });
+                        if let Some(cbs) = content_blocks {
+                            obj["content_blocks"] = json!(cbs);
+                            if !content.is_empty() {
+                                obj["content"] = json!(content);
+                            }
+                        } else {
+                            obj["content"] = json!(content);
+                        }
+                        if let Some(e) = is_error {
+                            obj["is_error"] = json!(e);
+                        }
+                        obj
+                    }
+                    crate::models::ContentBlock::ServerToolUse { id, name, input } => {
+                        json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+                    }
+                    crate::models::ContentBlock::ToolSearchToolResult { tool_use_id, content } => {
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
+                    crate::models::ContentBlock::CodeExecutionToolResult { tool_use_id, content } => {
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
                 })
                 .collect();
             json!({
@@ -707,21 +1075,121 @@ async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
     let skills_dir = resolve_skills_dir(&state.config, &state.workspace);
-    let registry = SkillRegistry::discover(&skills_dir);
+    let (registry, directories) = discover_skills_for_runtime_api(&state.workspace, &skills_dir);
+    let skill_state = state.skill_state.lock().await;
     let skills = registry
         .list()
         .iter()
         .map(|skill| SkillEntry {
             name: skill.name.clone(),
             description: skill.description.clone(),
-            path: skills_dir.join(&skill.name).join("SKILL.md"),
+            path: skill.path.clone(),
+            enabled: skill_state.is_enabled(&skill.name),
+            is_bundled: skill_entry_is_bundled(skill, &skills_dir),
         })
         .collect();
     Ok(Json(SkillsResponse {
         directory: skills_dir,
+        directories,
         warnings: registry.warnings().to_vec(),
         skills,
     }))
+}
+
+async fn set_skill_enabled(
+    State(state): State<RuntimeApiState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetSkillEnabledRequest>,
+) -> Result<Json<SetSkillEnabledResponse>, ApiError> {
+    let skills_dir = resolve_skills_dir(&state.config, &state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(&state.workspace, &skills_dir);
+    let exists = registry.list().iter().any(|skill| skill.name == name);
+    if !exists {
+        return Err(ApiError::not_found(format!(
+            "skill '{name}' not found in searched directories: {}",
+            format_skill_search_paths(&directories)
+        )));
+    }
+
+    let mut store = state.skill_state.lock().await;
+    store
+        .set_enabled(&name, req.enabled)
+        .map_err(|err| ApiError::internal(format!("persist skill state: {err}")))?;
+    Ok(Json(SetSkillEnabledResponse {
+        name,
+        enabled: req.enabled,
+    }))
+}
+
+async fn decide_approval(
+    State(state): State<RuntimeApiState>,
+    Path(approval_id): Path<String>,
+    Json(req): Json<DecideApprovalBody>,
+) -> Result<Json<DecideApprovalResponse>, ApiError> {
+    let decision = match req.decision.as_str() {
+        "allow" => ExternalApprovalDecision::Allow {
+            remember: req.remember,
+        },
+        "deny" => ExternalApprovalDecision::Deny {
+            remember: req.remember,
+        },
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "invalid decision '{other}'; expected \"allow\" or \"deny\""
+            )));
+        }
+    };
+    let delivered = state
+        .runtime_threads
+        .deliver_external_approval(&approval_id, decision);
+    if !delivered {
+        return Err(ApiError::not_found(format!(
+            "no pending approval with id '{approval_id}'"
+        )));
+    }
+    Ok(Json(DecideApprovalResponse {
+        ok: true,
+        approval_id,
+        decision: req.decision,
+        delivered,
+    }))
+}
+
+async fn submit_user_input(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, input_id)): Path<(String, String)>,
+    Json(req): Json<SubmitUserInputBody>,
+) -> Result<Json<SubmitUserInputResponse>, ApiError> {
+    use crate::tools::user_input::{UserInputAnswer, UserInputResponse};
+    let answers: Vec<UserInputAnswer> = req
+        .answers
+        .into_iter()
+        .map(|a| UserInputAnswer {
+            id: a.id,
+            label: a.label,
+            value: a.value,
+        })
+        .collect();
+    let response = UserInputResponse { answers };
+    let delivered = state
+        .runtime_threads
+        .submit_user_input(&thread_id, &input_id, response)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(SubmitUserInputResponse {
+        ok: true,
+        input_id,
+        delivered,
+    }))
+}
+
+async fn runtime_info(State(state): State<RuntimeApiState>) -> Json<RuntimeInfoResponse> {
+    Json(RuntimeInfoResponse {
+        bind_host: state.bind_host.clone(),
+        port: state.bind_port,
+        auth_required: state.auth_required,
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 async fn list_mcp_servers(
@@ -1293,6 +1761,8 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
             }
         }
         "approval.required" => Some(sse_json("approval.required", payload.clone())),
+        "approval.decided" => Some(sse_json("approval.decided", payload.clone())),
+        "approval.timeout" => Some(sse_json("approval.timeout", payload.clone())),
         "sandbox.denied" => Some(sse_json("sandbox.denied", payload.clone())),
         "turn.completed" => {
             let usage = payload
@@ -1389,30 +1859,79 @@ fn run_git(workspace: &std::path::Path, args: &[&str]) -> Option<String> {
 }
 
 fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
-    let agents_skills = workspace.join(".agents").join("skills");
-    if agents_skills.exists() {
-        return agents_skills;
-    }
-    let local_skills = workspace.join("skills");
-    if local_skills.exists() {
-        return local_skills;
+    // Canonicalize the workspace once so the symlink-containment check below
+    // compares like-for-like. If the workspace can't be canonicalized at all
+    // (e.g. it doesn't exist on disk yet) fall back to the configured global
+    // skills dir rather than risk constructing paths from a non-existent root.
+    let canonical_workspace = match fs::canonicalize(workspace) {
+        Ok(path) => path,
+        Err(_) => return config.skills_dir(),
+    };
+    for candidate in [
+        canonical_workspace.join(".agents").join("skills"),
+        canonical_workspace.join("skills"),
+    ] {
+        // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
+        // `/etc` cannot promote arbitrary filesystem locations into the
+        // skills directory. The candidate must still resolve under the
+        // canonicalized workspace root after symlink expansion.
+        if let Ok(canon) = fs::canonicalize(&candidate)
+            && canon.starts_with(&canonical_workspace)
+            && canon.is_dir()
+        {
+            return canon;
+        }
     }
     config.skills_dir()
 }
 
-fn load_mcp_config_or_default(path: &std::path::Path) -> Result<McpConfig, ApiError> {
-    if !path.exists() {
-        return Ok(McpConfig::default());
+fn skills_search_directories(workspace: &FsPath, skills_dir: &FsPath) -> Vec<PathBuf> {
+    let mut directories = crate::skills::skills_directories(workspace);
+    if skills_dir.is_dir() && !directories.iter().any(|path| path == skills_dir) {
+        directories.push(skills_dir.to_path_buf());
     }
-    let raw = fs::read_to_string(path).map_err(|e| {
-        ApiError::internal(format!("Failed to read MCP config {}: {e}", path.display()))
-    })?;
-    serde_json::from_str::<McpConfig>(&raw).map_err(|e| {
-        ApiError::internal(format!(
-            "Failed to parse MCP config {}: {e}",
-            path.display()
-        ))
-    })
+    directories
+}
+
+fn discover_skills_for_runtime_api(
+    workspace: &FsPath,
+    skills_dir: &FsPath,
+) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
+    let directories = skills_search_directories(workspace, skills_dir);
+    let registry = crate::skills::discover_from_directories(directories.clone());
+    (registry, directories)
+}
+
+fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> bool {
+    if !crate::skills::is_bundled_skill_name(&skill.name) {
+        return false;
+    }
+
+    let expected_path = skills_dir.join(&skill.name).join("SKILL.md");
+    paths_refer_to_same_file(&skill.path, &expected_path)
+}
+
+fn paths_refer_to_same_file(left: &FsPath, right: &FsPath) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn format_skill_search_paths(directories: &[PathBuf]) -> String {
+    if directories.is_empty() {
+        return "<none>".to_string();
+    }
+    directories
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn load_mcp_config_or_default(path: &std::path::Path) -> Result<McpConfig, ApiError> {
+    crate::mcp::load_config(path)
+        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e:#}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1467,6 +1986,8 @@ async fn get_usage(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!(aggregation)))
 }
+
+const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
 
 /// Built-in dev origins always allowed by the runtime API (whalescale#255).
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
@@ -1632,9 +2153,171 @@ mod tests {
         }
     }
 
+    fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedSession {
+        SavedSession {
+            schema_version: 1,
+            metadata: SessionMetadata {
+                id: "session-1".to_string(),
+                title: "test session".to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                message_count: 1,
+                total_tokens: 0,
+                model: "test-model".to_string(),
+                workspace: PathBuf::from("."),
+                mode: None,
+                cost: Default::default(),
+                parent_session_id: None,
+                forked_from_message_count: None,
+                cumulative_turn_secs: 0,
+            },
+            messages: vec![crate::models::Message {
+                role: "assistant".to_string(),
+                content: blocks,
+            }],
+            system_prompt: None,
+            context_references: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_detail_tool_use_preserves_caller_metadata() {
+        let detail = session_to_detail(saved_session_with_blocks(vec![
+            crate::models::ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "task_shell_start".to_string(),
+                input: json!({ "cmd": "cargo test" }),
+                caller: Some(crate::models::ToolCaller {
+                    caller_type: "subagent".to_string(),
+                    tool_id: Some("parent-tool".to_string()),
+                }),
+            },
+        ]));
+
+        let block = &detail.messages[0]["content"][0];
+        assert_eq!(block["type"].as_str(), Some("tool_use"));
+        assert_eq!(block["caller"]["type"].as_str(), Some("subagent"));
+        assert_eq!(block["caller"]["tool_id"].as_str(), Some("parent-tool"));
+    }
+
+    #[test]
+    fn session_detail_tool_result_keeps_fallback_content_with_blocks() {
+        let detail = session_to_detail(saved_session_with_blocks(vec![
+            crate::models::ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: "fallback text".to_string(),
+                is_error: Some(false),
+                content_blocks: Some(vec![json!({
+                    "type": "text",
+                    "text": "structured text"
+                })]),
+            },
+        ]));
+
+        let block = &detail.messages[0]["content"][0];
+        assert_eq!(block["type"].as_str(), Some("tool_result"));
+        assert_eq!(block["content"].as_str(), Some("fallback text"));
+        assert_eq!(
+            block["content_blocks"][0]["text"].as_str(),
+            Some("structured text")
+        );
+        assert_eq!(block["is_error"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn runtime_auth_generates_token_by_default() {
+        let auth = resolve_runtime_auth(None, None, false);
+        assert!(auth.generated);
+        let token = auth.token.expect("generated token");
+        assert!(token.starts_with("dst_"));
+        assert!(token.len() > 32);
+    }
+
+    #[test]
+    fn runtime_auth_requires_explicit_insecure_for_no_token() {
+        let auth = resolve_runtime_auth(None, None, true);
+        assert_eq!(
+            auth,
+            ResolvedRuntimeAuth {
+                token: None,
+                generated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_auth_prefers_cli_token_over_env_token() {
+        let auth = resolve_runtime_auth(
+            Some(" cli-token ".to_string()),
+            Some("env-token".to_string()),
+            false,
+        );
+        assert_eq!(
+            auth,
+            ResolvedRuntimeAuth {
+                token: Some("cli-token".to_string()),
+                generated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_auth_ignores_blank_configured_tokens() {
+        let auth = resolve_runtime_auth(Some(" ".to_string()), Some("\t".to_string()), false);
+        assert!(auth.generated);
+        assert!(auth.token.is_some());
+    }
+
+    #[test]
+    fn url_query_component_percent_encodes_token() {
+        assert_eq!(
+            url_query_component("abc ABC+/?:=&%"),
+            "abc%20ABC%2B%2F%3F%3A%3D%26%25"
+        );
+    }
+
+    #[test]
+    fn token_from_query_decodes_percent_encoded_token() {
+        assert_eq!(
+            token_from_query(Some("since_seq=0&token=abc%20ABC%2B%2F%3F%3A%3D%26%25")),
+            Some("abc ABC+/?:=&%".to_string())
+        );
+        assert_eq!(token_from_query(Some("token=bad%ZZ")), None);
+    }
+
     async fn spawn_test_server_with_root(
         root: PathBuf,
         sessions_dir: PathBuf,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        spawn_test_server_with_root_and_token(root, sessions_dir, None).await
+    }
+
+    async fn spawn_test_server_with_root_and_token(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        spawn_test_server_with_root_token_and_mobile(root, sessions_dir, runtime_token, false).await
+    }
+
+    async fn spawn_test_server_with_root_token_and_mobile(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+        mobile_enabled: bool,
     ) -> Result<
         Option<(
             SocketAddr,
@@ -1686,6 +2369,7 @@ mod tests {
         )?));
         runtime_threads.attach_automation_manager(automations.clone());
 
+        let auth_required = runtime_token.is_some();
         let state = RuntimeApiState {
             config: Config::default(),
             workspace: PathBuf::from("."),
@@ -1695,6 +2379,14 @@ mod tests {
             sessions_dir,
             mcp_config_path: root.join("mcp.json"),
             automations,
+            runtime_token,
+            skill_state: Arc::new(Mutex::new(
+                SkillStateStore::load_from(root.join("skills_state.toml")).unwrap_or_default(),
+            )),
+            auth_required,
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 0,
+            mobile_enabled,
         };
         let app = build_router(state);
         let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -1853,6 +2545,50 @@ mod tests {
             .error_for_status()?
             .json()
             .await?;
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-runtime-api-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let token = "local-test-token".to_string();
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+        else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+
+        let health = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauthorized = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .send()
+            .await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let bearer = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(bearer.status(), StatusCode::OK);
+
+        let query_token = client
+            .get(format!("http://{addr}/v1/threads/summary?token={token}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(query_token.status(), StatusCode::OK);
 
         handle.abort();
         Ok(())
@@ -2767,11 +3503,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("deepseek-session-resume-{}", Uuid::new_v4()));
         let sessions_dir = root.join("sessions");
         fs::create_dir_all(&sessions_dir)?;
-        let session_id = "sess_test_resume";
         let session = json!({
             "schema_version": 1,
             "metadata": {
-                "id": session_id,
+                "id": "sess_test_resume",
                 "title": "Test resume session",
                 "created_at": "2025-01-01T00:00:00Z",
                 "updated_at": "2025-01-01T00:10:00Z",
@@ -2794,7 +3529,7 @@ mod tests {
             "system_prompt": null
         });
         fs::write(
-            sessions_dir.join(format!("{session_id}.json")),
+            sessions_dir.join("sess_test_resume.json"),
             serde_json::to_string_pretty(&session)?,
         )?;
 
@@ -2807,14 +3542,14 @@ mod tests {
 
         let resp = client
             .post(format!(
-                "http://{addr}/v1/sessions/{session_id}/resume-thread"
+                "http://{addr}/v1/sessions/sess_test_resume/resume-thread"
             ))
             .json(&json!({ "model": "deepseek-v4-pro" }))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let resumed: serde_json::Value = resp.json().await?;
-        assert_eq!(resumed["session_id"], session_id);
+        assert_eq!(resumed["session_id"], "sess_test_resume");
         assert_eq!(resumed["message_count"], 2);
 
         let thread_id = resumed["thread_id"]
@@ -3194,5 +3929,365 @@ mod tests {
 
         handle.abort();
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_info_reports_bind_state() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let info: serde_json::Value = client
+            .get(format!("http://{addr}/v1/runtime/info"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(info["bind_host"], "127.0.0.1");
+        assert_eq!(info["auth_required"], false);
+        assert!(info["version"].is_string());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_page_is_available_only_when_enabled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_root_token_and_mobile(
+            root.clone(),
+            sessions_dir.clone(),
+            None,
+            false,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let disabled = client.get(format!("http://{addr}/mobile")).send().await?;
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_and_mobile(root, sessions_dir, None, true).await?
+        else {
+            return Ok(());
+        };
+        let enabled = client
+            .get(format!("http://{addr}/mobile"))
+            .send()
+            .await?
+            .error_for_status()?;
+        let html = enabled.text().await?;
+        assert!(html.contains("CodeWhale Mobile"));
+        assert!(html.contains("/v1/approvals/"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_page_requires_runtime_token_when_auth_enabled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let token = "abc ABC+/?:=&%".to_string();
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_root_token_and_mobile(
+            root,
+            sessions_dir,
+            Some(token.clone()),
+            true,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+
+        let unauthorized = client.get(format!("http://{addr}/mobile")).send().await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let encoded = url_query_component(&token);
+        let query = client
+            .get(format!("http://{addr}/mobile?token={encoded}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(query.text().await?.contains("CodeWhale Mobile"));
+
+        let bearer = client
+            .get(format!("http://{addr}/mobile"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(bearer.text().await?.contains("CodeWhale Mobile"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_insecure_mode_allows_page_and_v1_routes_without_token() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_and_mobile(root, sessions_dir, None, true).await?
+        else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+
+        let page = client
+            .get(format!("http://{addr}/mobile"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(page.text().await?.contains("CodeWhale Mobile"));
+
+        let summary = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(summary.status(), StatusCode::OK);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_404s_when_nothing_pending() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/no_such_id"))
+            .json(&json!({ "decision": "allow" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_400s_on_bad_decision() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/whatever"))
+            .json(&json!({ "decision": "yolo" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_delivers_to_runtime() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let rx = runtime_threads.register_pending_approval_for_test("ext_id");
+
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/ext_id"))
+            .json(&json!({ "decision": "allow", "remember": false }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["decision"], "allow");
+        assert_eq!(body["delivered"], true);
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx).await??;
+        assert_eq!(
+            received,
+            ExternalApprovalDecision::Allow { remember: false }
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_endpoint_includes_enabled_field() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/v1/skills"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(skills) = body["skills"].as_array() {
+            for skill in skills {
+                assert!(skill.get("enabled").is_some());
+            }
+        }
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_toggle_endpoint_404s_for_unknown_skill() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/skills/no-such-skill"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_skills_dir_finds_workspace_local_agents_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let local_skills = workspace.join(".agents").join("skills");
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, workspace);
+
+        let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_skills_dir_finds_workspace_local_skills_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let local_skills = workspace.join("skills");
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, workspace);
+
+        let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn skills_search_directories_includes_custom_skills_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let custom_skills = tmp.path().join("custom-skills");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&custom_skills).expect("create custom skills");
+
+        let directories = skills_search_directories(&workspace, &custom_skills);
+
+        assert!(
+            directories.iter().any(|dir| dir == &custom_skills),
+            "custom skills_dir must be reported when discovery searches it"
+        );
+        let message = format_skill_search_paths(&directories);
+        assert!(message.contains("custom-skills"));
+    }
+
+    #[test]
+    fn skill_entry_is_bundled_requires_configured_bundle_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundled_skills_dir = tmp.path().join("bundled-skills");
+        let bundled_skill_path = bundled_skills_dir.join("delegate").join("SKILL.md");
+        let override_skill_path = tmp
+            .path()
+            .join("workspace")
+            .join(".agents")
+            .join("skills")
+            .join("delegate")
+            .join("SKILL.md");
+        fs::create_dir_all(bundled_skill_path.parent().expect("bundled parent"))
+            .expect("create bundled skill dir");
+        fs::create_dir_all(override_skill_path.parent().expect("override parent"))
+            .expect("create override skill dir");
+        fs::write(
+            &bundled_skill_path,
+            "---\nname: delegate\ndescription: bundled\n---\n",
+        )
+        .expect("write bundled skill");
+        fs::write(
+            &override_skill_path,
+            "---\nname: delegate\ndescription: override\n---\n",
+        )
+        .expect("write override skill");
+
+        let bundled_skill = crate::skills::Skill {
+            name: "delegate".to_string(),
+            description: String::new(),
+            body: String::new(),
+            path: bundled_skill_path,
+        };
+        let override_skill = crate::skills::Skill {
+            name: "delegate".to_string(),
+            description: String::new(),
+            body: String::new(),
+            path: override_skill_path,
+        };
+
+        assert!(skill_entry_is_bundled(&bundled_skill, &bundled_skills_dir));
+        assert!(!skill_entry_is_bundled(
+            &override_skill,
+            &bundled_skills_dir
+        ));
+    }
+
+    /// A `skills` symlink that points outside the workspace must NOT be
+    /// returned as the resolved skills directory. Containment check ensures
+    /// the canonicalized candidate stays under the canonicalized workspace
+    /// root, so a malicious or misconfigured symlink can't promote
+    /// `/etc` (or any other path) into the skills loader.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        let escape_target = tmp.path().join("escape_target");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::create_dir_all(&escape_target).expect("create escape target");
+
+        let dotagents = workspace_root.join(".agents");
+        fs::create_dir_all(&dotagents).expect("create .agents");
+        let bad_link = dotagents.join("skills");
+        std::os::unix::fs::symlink(&escape_target, &bad_link).expect("symlink");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, &workspace_root);
+
+        let canon_escape = fs::canonicalize(&escape_target).expect("canon escape");
+        assert_ne!(
+            resolved, canon_escape,
+            "symlink escaping workspace must not be resolved as skills dir"
+        );
+        assert_eq!(
+            resolved,
+            config.skills_dir(),
+            "with no valid in-workspace skills dir, resolution should fall back to config"
+        );
     }
 }

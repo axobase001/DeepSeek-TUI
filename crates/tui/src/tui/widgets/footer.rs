@@ -39,6 +39,8 @@ pub struct FooterProps {
     pub text_hint_color: Color,
     /// Color used for steady secondary chips such as cost.
     pub text_muted_color: Color,
+    /// Background color for the full footer/status bar row.
+    pub footer_bg: Color,
     /// Status label like `"ready"`, `"thinking ⌫"`, `"working"`. When the
     /// label equals `"ready"` the footer hides the status segment entirely.
     pub state_label: String,
@@ -80,62 +82,49 @@ pub struct FooterProps {
     pub working_strip_frame: Option<u64>,
 }
 
-/// One frame of the footer's water-spout animation. `col` is the cell index
-/// inside the strip, `width` the strip's total width, `frame` the raw
+const WAVE_GLYPHS: [char; 8] = [
+    '\u{2581}', // ▁
+    '\u{2582}', // ▂
+    '\u{2583}', // ▃
+    '\u{2584}', // ▄
+    '\u{2585}', // ▅
+    '\u{2586}', // ▆
+    '\u{2587}', // ▇
+    '\u{2588}', // █
+];
+
+/// One frame of the footer's live-work wave animation. `col` is the cell
+/// index inside the strip, `width` the strip's total width, `frame` the raw
 /// millisecond counter. Returns the glyph that should appear in that cell on
 /// that frame.
 ///
-/// Visual: two crests sweep across a calm water surface (`─`). The opener
-/// `⌒` rises, then a soft `‿` trails behind. Crest A advances one column
-/// every ~600 ms (4 × 150 ms), crest B every ~900 ms (6 × 150 ms) —
-/// independent speeds give the criss-cross fountain feel. The positions
-/// are computed from `frame / 150.0` (fractional) so crests slide smoothly
-/// rather than jumping in discrete 150 ms steps.
-///
-/// All math is pure given (col, width, frame) so unit tests can pin frames.
+/// Visual: a full-width phase-shifted wave made from one-cell block-height
+/// glyphs. The earlier crest-pair animation only changed when rounded crest
+/// positions crossed a terminal cell boundary; at an 80 ms repaint cadence it
+/// read as visible hops. Sampling a few moving sine components gives every
+/// repaint a new surface while keeping the math deterministic for tests.
 #[must_use]
 pub fn footer_working_strip_glyph_at(col: usize, width: usize, frame: u64) -> char {
     if width == 0 {
         return ' ';
     }
 
-    // Number of 150 ms ticks since epoch — fractional so crests move
-    // continuously rather than teleporting every 4-6 ticks.
-    let frame_f = frame as f64 / 150.0;
+    let t = frame as f64 / 1000.0;
+    let x = col as f64;
 
-    // Crest is two glyphs wide: the leading `⌒` followed by a trailing `‿`.
-    const CREST_SPAN: i64 = 2;
-    // Cycle wide enough that each crest enters and exits cleanly.
-    let cycle = (width as i64).max(CREST_SPAN) + CREST_SPAN * 2;
-    // Crest A advances one column every ~300 ms (2 × 150 ms ticks).
-    let pos_a = (frame_f / 2.0).round() as i64 % cycle - CREST_SPAN;
-    // Phase jitter: every ~2.5 s (17 ticks), nudge B by one column so the
-    // two crests never lock into a fixed offset.
-    let jitter = (frame_f / 17.0).round() as i64 % 3;
-    // Crest B advances one column every ~450 ms (3 × 150 ms ticks).
-    let pos_b =
-        ((frame_f / 3.0).round() as i64 + jitter + (cycle / 3) + 5).rem_euclid(cycle) - CREST_SPAN;
-
-    crest_glyph_for(col as i64, pos_a)
-        .or_else(|| crest_glyph_for(col as i64, pos_b))
-        .unwrap_or('\u{2500}') // ─  — calm water surface
+    let primary = (x * 0.52 - t * 8.0).sin();
+    let swell = (x * 0.18 + t * 3.1).sin() * 0.35;
+    let shimmer = (x * 1.35 - t * 11.0).sin() * 0.12;
+    let value = ((primary + swell + shimmer) / 1.47).clamp(-1.0, 1.0);
+    let normalized = (value + 1.0) * 0.5;
+    let idx = (normalized * (WAVE_GLYPHS.len() - 1) as f64).round() as usize;
+    WAVE_GLYPHS[idx.min(WAVE_GLYPHS.len() - 1)]
 }
 
-/// Helper: returns the glyph for column `col` if it falls inside a crest
-/// centred at `pos`. A crest is `⌒‿` shaped — soft rise then a gentle dip.
-fn crest_glyph_for(col: i64, pos: i64) -> Option<char> {
-    let dist = col - pos;
-    match dist {
-        0 => Some('\u{2312}'), // ⌒  arc rising from the left
-        1 => Some('\u{203F}'), // ‿  trailing dip
-        _ => None,
-    }
-}
-
-/// Build the per-frame water-spout string of `width` characters. Empty string
+/// Build the per-frame live-work wave string of `width` characters. Empty string
 /// when width is 0. The result is the same visual width as requested (one
-/// char per column for box-drawing chars) and is safe to drop into a `Span`
-/// between the footer's left and right segments.
+/// char per column for the selected block-height glyphs) and is safe to drop
+/// into a `Span` between the footer's left and right segments.
 #[must_use]
 pub fn footer_working_strip_string(width: usize, frame: u64) -> String {
     let mut out = String::with_capacity(width * 4);
@@ -161,6 +150,19 @@ pub fn footer_working_label(frame: u64, locale: Locale) -> String {
         out.push('.');
     }
     out
+}
+
+/// Build a "⏳ shell running" chip span when a foreground shell command is
+/// active. Empty when no shell is running, which hides the chip entirely.
+#[must_use]
+pub fn footer_shell_chip(active: bool) -> Vec<Span<'static>> {
+    if !active {
+        return Vec::new();
+    }
+    vec![Span::styled(
+        "\u{23F3} shell running".to_string(),
+        Style::default().fg(palette::STATUS_WARNING),
+    )]
 }
 
 /// Build a "N agents" chip span list when there are sub-agents in flight.
@@ -281,6 +283,7 @@ impl FooterProps {
             text_dim_color: app.ui_theme.text_dim,
             text_hint_color: app.ui_theme.text_hint,
             text_muted_color: app.ui_theme.text_muted,
+            footer_bg: app.ui_theme.footer_bg,
             state_label: state_label.to_string(),
             state_color,
             coherence,
@@ -516,6 +519,20 @@ impl FooterWidget {
         }
         spans
     }
+
+    fn left_spans(&self, max_width: usize) -> Vec<Span<'static>> {
+        if let Some(banner) = retry_banner_spans(max_width, &self.props) {
+            // Retry banner takes precedence over toast and the regular
+            // status line so the user sees it loud and clear (#499).
+            // The banner clears automatically on success or on the next
+            // `TurnStarted` (engine emits the clear).
+            banner
+        } else if let Some(toast) = self.props.toast.as_ref() {
+            Self::toast_spans(toast, max_width)
+        } else {
+            self.status_line_spans(max_width)
+        }
+    }
 }
 
 fn spans_text(spans: &[Span<'_>]) -> String {
@@ -556,25 +573,30 @@ impl Renderable for FooterWidget {
             return;
         }
 
-        let right_spans = self.auxiliary_spans(available_width);
+        // Clear the whole footer row first so stale transcript glyphs from
+        // the previous frame cannot survive in cells this frame's spans do not
+        // touch (#2244).
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)]
+                    .set_symbol(" ")
+                    .set_style(Style::default().bg(self.props.footer_bg));
+            }
+        }
+
+        let preview_left_spans = self.left_spans(available_width);
+        let preview_left_width = span_width(&preview_left_spans);
+        let right_budget = available_width
+            .saturating_sub(preview_left_width)
+            .saturating_sub(2);
+        let right_spans = self.auxiliary_spans(right_budget);
         let right_width = span_width(&right_spans);
         let min_gap = if right_width > 0 { 2 } else { 0 };
         let max_left_width = available_width
             .saturating_sub(right_width)
             .saturating_sub(min_gap)
             .max(1);
-
-        let left_spans = if let Some(banner) = retry_banner_spans(max_left_width, &self.props) {
-            // Retry banner takes precedence over toast and the regular
-            // status line so the user sees it loud and clear (#499).
-            // The banner clears automatically on success or on the next
-            // `TurnStarted` (engine emits the clear).
-            banner
-        } else if let Some(toast) = self.props.toast.as_ref() {
-            Self::toast_spans(toast, max_left_width)
-        } else {
-            self.status_line_spans(max_left_width)
-        };
+        let left_spans = self.left_spans(max_left_width);
 
         let left_width = span_width(&left_spans);
         let spacer_width = available_width.saturating_sub(left_width + right_width);
@@ -593,7 +615,8 @@ impl Renderable for FooterWidget {
         all_spans.push(spacer_span);
         all_spans.extend(right_spans);
 
-        let paragraph = Paragraph::new(Line::from(all_spans));
+        let paragraph =
+            Paragraph::new(Line::from(all_spans)).style(Style::default().bg(self.props.footer_bg));
         paragraph.render(area, buf);
     }
 
@@ -640,10 +663,13 @@ mod tests {
     use crate::palette;
     use crate::tui::app::{App, AppMode, TuiOptions};
     use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
         style::{Color, Style},
         text::Span,
     };
     use std::path::PathBuf;
+    use unicode_width::UnicodeWidthStr;
 
     fn make_app() -> App {
         let options = TuiOptions {
@@ -668,10 +694,15 @@ mod tests {
             initial_input: None,
         };
         let mut app = App::new(options, &Config::default());
-        // App::new may pick up `default_model` from a local user Settings
-        // file, which overrides the option above. Pin the model explicitly
-        // so these tests are independent of any host-side configuration.
+        // App::new may pick up local Settings, which override the option
+        // above. Pin model state explicitly so these tests are host-neutral.
         app.model = "deepseek-v4-flash".to_string();
+        app.auto_model = false;
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        // Same for theme: tests below assert against the default dark palette,
+        // but App::new honors saved settings.toml values on the host machine.
+        app.theme_id = crate::palette::ThemeId::Whale;
+        app.ui_theme = crate::palette::UI_THEME;
         app
     }
 
@@ -811,6 +842,7 @@ mod tests {
         app.ui_theme.text_dim = Color::Rgb(4, 5, 6);
         app.ui_theme.text_hint = Color::Rgb(7, 8, 9);
         app.ui_theme.text_muted = Color::Rgb(10, 11, 12);
+        app.ui_theme.footer_bg = Color::Rgb(13, 14, 15);
 
         let props = idle_props_for(&app);
 
@@ -818,6 +850,23 @@ mod tests {
         assert_eq!(props.text_dim_color, Color::Rgb(4, 5, 6));
         assert_eq!(props.text_hint_color, Color::Rgb(7, 8, 9));
         assert_eq!(props.text_muted_color, Color::Rgb(10, 11, 12));
+        assert_eq!(props.footer_bg, Color::Rgb(13, 14, 15));
+    }
+
+    #[test]
+    fn render_applies_footer_background_to_full_row() {
+        let mut app = make_app();
+        app.ui_theme.footer_bg = Color::Rgb(13, 14, 15);
+        let props = idle_props_for(&app);
+        let widget = FooterWidget::new(props);
+        let area = ratatui::layout::Rect::new(0, 0, 60, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+
+        for x in 0..area.width {
+            assert_eq!(buf[(x, 0)].bg, Color::Rgb(13, 14, 15));
+        }
     }
 
     // ---- agents chip wording ----
@@ -996,8 +1045,7 @@ mod tests {
     fn working_strip_string_width_matches_request() {
         // The strip must produce exactly `width` characters per frame —
         // otherwise the spacer math in `FooterWidget::render` would
-        // mis-align the right-hand chips. (Glyphs are all ASCII / Latin-1
-        // so char count equals visual width here.)
+        // mis-align the right-hand chips. Each wave glyph is one cell wide.
         for width in [0usize, 1, 8, 60, 200] {
             let s = super::footer_working_strip_string(width, 7);
             assert_eq!(s.chars().count(), width, "width {width} mismatch");
@@ -1006,21 +1054,19 @@ mod tests {
 
     #[test]
     fn working_strip_glyph_is_deterministic_per_frame() {
-        // Same (col, width, frame) → same glyph. Frames are now raw
-        // milliseconds; 150 ms apart represents one tick.
+        // Same (col, width, frame) -> same glyph. Frames are raw
+        // milliseconds so the strip can move at repaint cadence.
         let a = super::footer_working_strip_string(40, 150);
         let b = super::footer_working_strip_string(40, 150);
         assert_eq!(a, b, "deterministic given the same frame");
-        // 750 ms → 5 ticks, crest A advances every 2 ticks → ≥2 steps.
-        let c = super::footer_working_strip_string(40, 750);
-        assert_ne!(a, c, "advancing 4 ticks must change the strip",);
+        let c = super::footer_working_strip_string(40, 230);
+        assert_ne!(a, c, "advancing one repaint window must change the strip",);
     }
 
     #[test]
     fn working_strip_renders_glyphs_only_when_frame_is_some() {
         // Idle: spacer is plain whitespace. Active: spacer contains the
-        // crest animation glyphs (`⌒` opener, `‿` trailer, `─` water
-        // surface) and visibly differs from the idle render.
+        // wave animation glyphs and visibly differs from the idle render.
         let app = make_app();
         let mut props = idle_props_for(&app);
 
@@ -1039,51 +1085,41 @@ mod tests {
             "active footer must visibly differ from idle one"
         );
         assert!(
-            active.contains('\u{2312}')   // ⌒  crest opener
-                || active.contains('\u{203F}') // ‿  crest trailer
-                || active.contains('\u{2500}'), // ─  water surface
+            active
+                .chars()
+                .any(|glyph| super::WAVE_GLYPHS.contains(&glyph)),
             "active strip must contain at least one animation glyph: {active:?}",
         );
     }
 
     #[test]
-    fn working_strip_advances_position_within_full_crest_step() {
-        // Crest A advances every 2 ticks (300 ms), B every 3 (450 ms).
-        // 900 ms (6 ticks) guarantees crest A has advanced at least 3 columns.
+    fn working_strip_changes_at_repaint_cadence() {
         let width = 60;
         let f0 = super::footer_working_strip_string(width, 0);
-        let f900 = super::footer_working_strip_string(width, 900);
-        // Collect the columns that hold a crest opener `⌒` in each frame.
-        let openers = |s: &str| -> Vec<usize> {
-            s.chars()
-                .enumerate()
-                .filter_map(|(i, c)| (c == '\u{2312}').then_some(i))
-                .collect()
-        };
-        assert_ne!(
-            openers(&f0),
-            openers(&f900),
-            "crest opener columns must shift across a 900ms window",
+        let f80 = super::footer_working_strip_string(width, 80);
+        let changed = f0
+            .chars()
+            .zip(f80.chars())
+            .filter(|(before, after)| before != after)
+            .count();
+        assert!(
+            changed > width / 4,
+            "expected the wave to drift across one 80ms repaint; changed {changed}/{width}"
         );
     }
 
     #[test]
-    fn working_strip_renders_paired_crest_glyphs() {
-        // The `⌒‿` pair is the visual centrepiece — a soft rise followed by
-        // a gentle dip. Sweep enough time (in ms) that a crest is guaranteed
-        // to land fully inside a 60-cell strip at some point.
-        let width = 60;
-        let mut saw_pair = false;
-        for frame_ms in (0..24_000).step_by(150) {
-            let s = super::footer_working_strip_string(width, frame_ms);
-            if s.contains("\u{2312}\u{203F}") {
-                saw_pair = true;
-                break;
+    fn working_strip_renders_multiple_wave_heights() {
+        let s = super::footer_working_strip_string(60, 0);
+        let mut distinct = Vec::new();
+        for glyph in s.chars() {
+            if super::WAVE_GLYPHS.contains(&glyph) && !distinct.contains(&glyph) {
+                distinct.push(glyph);
             }
         }
         assert!(
-            saw_pair,
-            "expected `⌒‿` pair somewhere in the first 24s of animation",
+            distinct.len() >= 5,
+            "expected several wave heights, saw {distinct:?}",
         );
     }
 
@@ -1229,6 +1265,70 @@ mod tests {
         )
     }
 
+    #[test]
+    fn render_drops_oversized_right_chips_before_they_crowd_left_status() {
+        let app = make_app();
+        let long_cache = vec![Span::styled(
+            "Cache: 75.0% hit | hit 36000 | miss 12000".to_string(),
+            Style::default(),
+        )];
+        let props = FooterProps::from_app(
+            &app,
+            None,
+            "ready",
+            palette::TEXT_MUTED,
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            long_cache,
+            Vec::<Span<'static>>::new(),
+        );
+
+        let line = render_at_width(props, 40);
+
+        assert!(
+            line.contains("agent"),
+            "left status should survive: {line:?}"
+        );
+        assert!(
+            !line.contains("Cache:"),
+            "oversized right chip should drop instead of crowding the row: {line:?}",
+        );
+        assert!(line.width() <= 40, "footer must fit in one row: {line:?}");
+    }
+
+    #[test]
+    fn render_keeps_right_chips_when_left_status_leaves_room() {
+        let app = make_app();
+        let cache = vec![Span::styled(
+            "Cache: 75.0% hit".to_string(),
+            Style::default(),
+        )];
+        let props = FooterProps::from_app(
+            &app,
+            None,
+            "ready",
+            palette::TEXT_MUTED,
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            cache,
+            Vec::<Span<'static>>::new(),
+        );
+
+        let line = render_at_width(props, 80);
+
+        assert!(
+            line.contains("agent"),
+            "left status should render: {line:?}"
+        );
+        assert!(
+            line.contains("Cache: 75.0% hit"),
+            "right chip should render: {line:?}"
+        );
+        assert!(line.width() <= 80, "footer must fit in one row: {line:?}");
+    }
+
     /// v0.6.6 redesign — cost lives on the LEFT, between model and status.
     /// At wide widths the line reads `mode · model · cost · status`.
     #[test]
@@ -1289,5 +1389,37 @@ mod tests {
         assert!(rendered.contains("session saved"));
         assert!(!rendered.contains("agent"));
         assert!(!rendered.contains("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn render_clears_stale_cells_across_entire_footer_row() {
+        let app = make_app();
+        let widget = FooterWidget::new(idle_props_for(&app));
+        let area = Rect::new(0, 0, 48, 1);
+        let mut buf = Buffer::empty(area);
+
+        for x in area.x..area.x.saturating_add(area.width) {
+            buf[(x, area.y)]
+                .set_symbol("X")
+                .set_style(Style::default().fg(Color::Red).bg(Color::Blue));
+        }
+
+        widget.render(area, &mut buf);
+
+        let rendered: String = (area.x..area.x.saturating_add(area.width))
+            .map(|x| buf[(x, area.y)].symbol())
+            .collect();
+
+        assert!(
+            !rendered.contains('X'),
+            "footer render must clear stale row content before painting: {rendered:?}"
+        );
+        for x in area.x..area.x.saturating_add(area.width) {
+            assert_eq!(
+                buf[(x, area.y)].bg,
+                app.ui_theme.footer_bg,
+                "footer background should cover the full row"
+            );
+        }
     }
 }

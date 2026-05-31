@@ -51,8 +51,8 @@ use crate::network_policy::{Decision, NetworkPolicy, host_from_url};
 /// skills and can be blown away without losing anything irreplaceable.
 pub fn default_cache_skills_dir() -> PathBuf {
     dirs::home_dir().map_or_else(
-        || PathBuf::from("/tmp/deepseek/cache/skills"),
-        |p| p.join(".deepseek").join("cache").join("skills"),
+        || PathBuf::from("/tmp/codewhale/cache/skills"),
+        |p| p.join(".codewhale").join("cache").join("skills"),
     )
 }
 
@@ -391,7 +391,10 @@ pub async fn update_with_registry(
     network: &NetworkPolicy,
     registry_url: &str,
 ) -> Result<UpdateResult> {
-    let target = skills_dir.join(name);
+    let target = skill_target_path(name, skills_dir)?;
+    if target.exists() {
+        ensure_target_within_skills_dir(&target, skills_dir)?;
+    }
     let marker_path = target.join(INSTALLED_FROM_MARKER);
     if !marker_path.exists() {
         return Err(InstallError::NotInstalledHere(name.to_string()).into());
@@ -399,7 +402,7 @@ pub async fn update_with_registry(
     let marker_body = fs::read_to_string(&marker_path)
         .with_context(|| format!("failed to read {}", marker_path.display()))?;
     let marker: InstalledFromMarker = serde_json::from_str(&marker_body)
-        .with_context(|| format!("malformed {} for {name}", INSTALLED_FROM_MARKER))?;
+        .with_context(|| format!("malformed {INSTALLED_FROM_MARKER} for {name}"))?;
 
     // Re-resolve the URL, taking the existing checksum as a short-circuit hint:
     // we still hit the network so the user gets a useful "no upstream change"
@@ -439,10 +442,11 @@ pub async fn update_with_registry(
 /// Refuses to touch any directory that doesn't carry the `.installed-from`
 /// marker — that's our cue that it's user-owned and not a system skill.
 pub fn uninstall(name: &str, skills_dir: &Path) -> Result<()> {
-    let target = skills_dir.join(name);
+    let target = skill_target_path(name, skills_dir)?;
     if !target.exists() {
         bail!("skill '{name}' is not installed at {}", target.display());
     }
+    ensure_target_within_skills_dir(&target, skills_dir)?;
     if !target.join(INSTALLED_FROM_MARKER).exists() {
         return Err(InstallError::NotInstalledHere(name.to_string()).into());
     }
@@ -458,10 +462,11 @@ pub fn uninstall(name: &str, skills_dir: &Path) -> Result<()> {
 /// Refuses to mark system skills (no `.installed-from`) so the bundled
 /// `skill-creator` doesn't accidentally inherit elevated tool privileges.
 pub fn trust(name: &str, skills_dir: &Path) -> Result<()> {
-    let target = skills_dir.join(name);
+    let target = skill_target_path(name, skills_dir)?;
     if !target.exists() {
         bail!("skill '{name}' is not installed at {}", target.display());
     }
+    ensure_target_within_skills_dir(&target, skills_dir)?;
     if !target.join(INSTALLED_FROM_MARKER).exists() {
         return Err(InstallError::NotInstalledHere(name.to_string()).into());
     }
@@ -719,8 +724,7 @@ async fn sync_one_skill(
             return SkillSyncOutcome::Failed {
                 name: name.to_string(),
                 reason: format!(
-                    "download from {url} exceeds compressed size cap ({} bytes)",
-                    compressed_cap
+                    "download from {url} exceeds compressed size cap ({compressed_cap} bytes)"
                 ),
             };
         }
@@ -1066,7 +1070,7 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
 
     let mut total_size: u64 = 0;
     let mut prefix: Option<String> = None;
-    let mut skill_md_relative: Option<(String, Vec<u8>)> = None;
+    let mut skill_md_relative: Option<(SkillMdCandidate, Vec<u8>)> = None;
     let mut link_paths: Vec<String> = Vec::new();
 
     for entry in archive
@@ -1122,46 +1126,38 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
             continue;
         }
 
-        // SKILL.md detection. Match either:
+        // SKILL.md detection. Match the same workflow layouts that runtime
+        // discovery understands:
         //   * `<prefix>/SKILL.md`
-        //   * `<prefix>/skills/<name>/SKILL.md`
+        //   * `<prefix>/*/skills/<name>/SKILL.md`
+        //   * `<prefix>/<name>/SKILL.md`
         if entry_type.is_file() {
             let stripped = strip_prefix(&path_str, prefix.as_deref().unwrap_or(""));
-            if stripped.eq_ignore_ascii_case("SKILL.md")
-                || stripped.starts_with("skills/")
-                    && stripped.ends_with("/SKILL.md")
-                    && stripped.matches('/').count() == 2
-            {
+            if let Some(candidate) = skill_md_candidate(&stripped) {
                 let mut buf = Vec::new();
                 entry
                     .read_to_end(&mut buf)
                     .context("failed to read SKILL.md from archive")?;
-                // Prefer the first match — we don't support multi-skill
-                // archives where a tarball ships several SKILL.mds at once.
-                if skill_md_relative.is_none() {
-                    skill_md_relative = Some((stripped.to_string(), buf));
+                // Prefer the most explicit match: repo-root SKILL.md first,
+                // then known skill-directory layouts, then a single nested
+                // `<name>/SKILL.md` repository.
+                let replace = skill_md_relative
+                    .as_ref()
+                    .is_none_or(|(current, _)| candidate.rank < current.rank);
+                if replace {
+                    skill_md_relative = Some((candidate, buf));
                 }
             }
         }
     }
 
     let prefix = prefix.unwrap_or_default();
-    let (skill_md_path, skill_md_bytes) = skill_md_relative
+    let (skill_md, skill_md_bytes) = skill_md_relative
         .ok_or(InstallError::MissingSkillMd)
         .map_err(anyhow::Error::from)?;
 
-    let skill_root = if skill_md_path == "SKILL.md" {
-        String::new()
-    } else {
-        // strip trailing /SKILL.md
-        skill_md_path
-            .strip_suffix("/SKILL.md")
-            .unwrap_or("")
-            .to_string()
-    };
-
     for link_path in link_paths {
-        if is_within_selected_root(&link_path, &prefix, &skill_root) {
+        if is_within_selected_root(&link_path, &prefix, &skill_md.skill_root) {
             return Err(InstallError::SymlinkRejected.into());
         }
     }
@@ -1174,8 +1170,56 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
     Ok(TarballScan {
         skill_name: name,
         prefix,
-        skill_root,
+        skill_root: skill_md.skill_root,
     })
+}
+
+struct SkillMdCandidate {
+    rank: u8,
+    skill_root: String,
+}
+
+fn skill_md_candidate(stripped_path: &str) -> Option<SkillMdCandidate> {
+    if stripped_path.eq_ignore_ascii_case("SKILL.md") {
+        return Some(SkillMdCandidate {
+            rank: 0,
+            skill_root: String::new(),
+        });
+    }
+
+    let parts: Vec<&str> = stripped_path.split('/').collect();
+    if parts
+        .last()
+        .is_none_or(|last| !last.eq_ignore_ascii_case("SKILL.md"))
+    {
+        return None;
+    }
+
+    // Common workflow-pack layouts:
+    // `skills/<name>/SKILL.md`, `.agents/skills/<name>/SKILL.md`,
+    // `.claude/skills/<name>/SKILL.md`, and nested package layouts such as
+    // `packages/foo/skills/<name>/SKILL.md`.
+    if parts.len() >= 3 {
+        let container = parts[parts.len() - 3];
+        let name = parts[parts.len() - 2];
+        if container.eq_ignore_ascii_case("skills") && !name.is_empty() {
+            return Some(SkillMdCandidate {
+                rank: 1,
+                skill_root: parts[..parts.len() - 1].join("/"),
+            });
+        }
+    }
+
+    // Single-skill repos sometimes keep their root tidy with
+    // `<skill-name>/SKILL.md` plus sibling docs at repo root.
+    if parts.len() == 2 && !parts[0].is_empty() {
+        return Some(SkillMdCandidate {
+            rank: 2,
+            skill_root: parts[0].to_string(),
+        });
+    }
+
+    None
 }
 
 fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) -> Result<()> {
@@ -1304,6 +1348,40 @@ fn is_safe_path(path: &Path) -> bool {
     true
 }
 
+fn skill_target_path(name: &str, skills_dir: &Path) -> Result<PathBuf> {
+    let name = validate_skill_name_segment(name)?;
+    Ok(skills_dir.join(name))
+}
+
+fn validate_skill_name_segment(name: &str) -> Result<&str> {
+    if name.is_empty() || name.trim() != name || name.chars().any(char::is_whitespace) {
+        bail!("skill name must be a single path-safe segment (got '{name}')");
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        bail!("skill name must be a single path-safe segment (got '{name}')");
+    }
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("skill name must be a single path-safe segment (got '{name}')");
+    }
+    Ok(name)
+}
+
+fn ensure_target_within_skills_dir(target: &Path, skills_dir: &Path) -> Result<()> {
+    let skills_dir = fs::canonicalize(skills_dir)
+        .with_context(|| format!("failed to resolve {}", skills_dir.display()))?;
+    let target = fs::canonicalize(target)
+        .with_context(|| format!("failed to resolve {}", target.display()))?;
+    if !target.starts_with(&skills_dir) {
+        bail!(
+            "skill path {} escapes skills directory {}",
+            target.display(),
+            skills_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Strip a leading directory prefix (e.g. `repo-main/`) from a tarball path.
 fn strip_prefix<'a>(path: &'a str, prefix: &str) -> std::borrow::Cow<'a, str> {
     if prefix.is_empty() {
@@ -1355,13 +1433,7 @@ fn parse_frontmatter_name(bytes: &[u8]) -> Result<String> {
     if !has_description {
         return Err(InstallError::MissingFrontmatterField("description").into());
     }
-    // Sanity check: name must be a single path-safe segment.
-    if name.contains('/')
-        || name.contains('\\')
-        || name == "."
-        || name == ".."
-        || name.contains(' ')
-    {
+    if validate_skill_name_segment(&name).is_err() {
         bail!("SKILL.md `name` must be a single path-safe segment (got '{name}')");
     }
     Ok(name)
@@ -1507,12 +1579,75 @@ mod tests {
 
         let body = b"---\nname: a name with spaces\ndescription: x\n---\n";
         assert!(parse_frontmatter_name(body).is_err());
+
+        let body = b"---\nname: tab\tname\ndescription: x\n---\n";
+        assert!(parse_frontmatter_name(body).is_err());
     }
 
     #[test]
     fn parse_frontmatter_requires_opening_fence() {
         let body = b"name: hello\ndescription: x\n";
         assert!(parse_frontmatter_name(body).is_err());
+    }
+
+    #[test]
+    fn user_skill_names_must_be_single_safe_segments() {
+        for bad in [
+            "",
+            "../evil",
+            "/tmp/evil",
+            "two words",
+            "two\twords",
+            "evil/name",
+            "evil\\name",
+            ".",
+            "..",
+            " leading",
+            "trailing ",
+        ] {
+            assert!(
+                validate_skill_name_segment(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert_eq!(
+            validate_skill_name_segment("safe-name_1").unwrap(),
+            "safe-name_1"
+        );
+    }
+
+    #[test]
+    fn uninstall_and_trust_reject_unsafe_skill_names_before_path_join() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+
+        for bad in [
+            "../evil",
+            "/tmp/evil",
+            "evil/name",
+            "evil\\name",
+            "two words",
+        ] {
+            assert!(uninstall(bad, &skills_dir).is_err());
+            assert!(trust(bad, &skills_dir).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_rejects_symlink_target_escaping_skills_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join(INSTALLED_FROM_MARKER), "{}").expect("marker");
+        std::os::unix::fs::symlink(&outside, skills_dir.join("linked")).expect("symlink");
+
+        let err = uninstall("linked", &skills_dir).unwrap_err();
+        assert!(err.to_string().contains("escapes skills directory"));
+        assert!(outside.exists());
     }
 
     #[test]

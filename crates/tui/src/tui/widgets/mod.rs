@@ -10,18 +10,21 @@ pub mod key_hint;
 // the composer area in `ui.rs`. `pub mod` (vs the usual `pub use` pattern)
 // keeps the unused-imports lint quiet until then.
 pub mod agent_card;
+pub mod decision_card;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
 
 pub use footer::{
-    FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_working_label,
+    FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_chip,
+    footer_working_label,
 };
-pub use header::{HeaderData, HeaderWidget};
+pub use header::{HeaderData, HeaderWidget, header_status_indicator_frame};
 pub use renderable::Renderable;
 
 use std::time::Duration;
 
+use crate::localization::Locale;
 use crate::palette;
 use crate::tui::app::{App, AppMode, ComposerDensity, VimMode};
 use crate::tui::approval::{
@@ -29,16 +32,18 @@ use crate::tui::approval::{
 };
 use crate::tui::history::HistoryCell;
 use crate::tui::scrolling::TranscriptLineMeta;
-use crate::{commands, config::COMMON_DEEPSEEK_MODELS};
+use crate::{
+    commands,
+    config::{ApiProvider, model_completion_names_for_provider},
+};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    prelude::Stylize,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        StatefulWidget, Widget, Wrap,
+        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, StatefulWidget, Widget, Wrap,
     },
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -46,11 +51,19 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEND_FLASH_DURATION: Duration = Duration::from_millis(500);
 const COMPOSER_PANEL_HEIGHT: u16 = 2;
+const JUMP_TO_LATEST_BUTTON_WIDTH: u16 = 3;
+const JUMP_TO_LATEST_BUTTON_HEIGHT: u16 = 3;
 
 pub struct ChatWidget {
     content_area: Rect,
     lines: Vec<Line<'static>>,
     scrollbar: Option<TranscriptScrollbar>,
+    jump_to_latest_button: Option<Rect>,
+    background: Color,
+    scroll_track: Color,
+    scroll_thumb: Color,
+    jump_border: Color,
+    jump_arrow: Color,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +76,11 @@ struct TranscriptScrollbar {
 impl ChatWidget {
     pub fn new(app: &mut App, area: Rect) -> Self {
         let content_area = area;
+        let background = app.ui_theme.surface_bg;
+        let scroll_track = app.ui_theme.border;
+        let scroll_thumb = app.ui_theme.status_working;
+        let jump_border = app.ui_theme.border;
+        let jump_arrow = app.ui_theme.status_working;
         let visible_lines = content_area.height as usize;
         let render_options = app.transcript_render_options();
 
@@ -73,10 +91,17 @@ impl ChatWidget {
             app.viewport.last_transcript_visible = visible_lines;
             app.viewport.last_transcript_total = 0;
             app.viewport.last_transcript_padding_top = 0;
+            app.viewport.jump_to_latest_button_area = None;
             return Self {
                 content_area,
                 lines,
                 scrollbar: None,
+                jump_to_latest_button: None,
+                background,
+                scroll_track,
+                scroll_thumb,
+                jump_border,
+                jump_arrow,
             };
         }
 
@@ -131,6 +156,8 @@ impl ChatWidget {
                 &cell_revisions,
                 content_area.width.max(1),
                 render_options,
+                &app.folded_thinking,
+                None,
             );
         } else {
             // Slow path: clone non-collapsed cells into filtered vecs so
@@ -178,6 +205,8 @@ impl ChatWidget {
                 &filtered_revs,
                 content_area.width.max(1),
                 render_options,
+                &app.folded_thinking,
+                Some(&app.collapsed_cell_map),
             );
         }
 
@@ -272,11 +301,24 @@ impl ChatWidget {
                 total: total_lines,
             },
         );
+        let jump_to_latest_button =
+            if app.use_mouse_capture && !app.viewport.transcript_scroll.is_at_tail() {
+                jump_to_latest_button_rect(content_area, scrollbar.is_some())
+            } else {
+                None
+            };
+        app.viewport.jump_to_latest_button_area = jump_to_latest_button;
 
         Self {
             content_area,
             lines,
             scrollbar,
+            jump_to_latest_button,
+            background,
+            scroll_track,
+            scroll_thumb,
+            jump_border,
+            jump_arrow,
         }
     }
 }
@@ -297,7 +339,7 @@ impl Renderable for ChatWidget {
 
         let area = _area;
 
-        // Repaint the full chat area with the deepseek-ink background each
+        // Repaint the full chat area with the codewhale-ink background each
         // frame. Ratatui's `Paragraph` only writes cells that contain text,
         // so cells the current frame's paragraph doesn't touch would
         // otherwise hold the *previous* frame's contents (the `:24Z`
@@ -306,11 +348,11 @@ impl Renderable for ChatWidget {
         // gray on most user setups; an explicit ink fill keeps the chat
         // area on-brand.
         Block::default()
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(self.background))
             .render(area, buf);
 
         let paragraph =
-            Paragraph::new(self.lines.clone()).style(Style::default().bg(palette::DEEPSEEK_INK));
+            Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
         if let Some(scrollbar) = self.scrollbar {
@@ -322,10 +364,20 @@ impl Renderable for ChatWidget {
                 .begin_symbol(None)
                 .end_symbol(None)
                 .track_symbol(Some("│"))
-                .track_style(Style::default().fg(palette::BORDER_COLOR))
+                .track_style(Style::default().fg(self.scroll_track))
                 .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(palette::DEEPSEEK_SKY))
+                .thumb_style(Style::default().fg(self.scroll_thumb))
                 .render(area, buf, &mut state);
+        }
+
+        if let Some(button_area) = self.jump_to_latest_button {
+            render_jump_to_latest_button(
+                button_area,
+                buf,
+                self.background,
+                self.jump_border,
+                self.jump_arrow,
+            );
         }
     }
 
@@ -334,10 +386,54 @@ impl Renderable for ChatWidget {
     }
 }
 
+fn jump_to_latest_button_rect(area: Rect, has_scrollbar: bool) -> Option<Rect> {
+    if area.width < JUMP_TO_LATEST_BUTTON_WIDTH + u16::from(has_scrollbar)
+        || area.height < JUMP_TO_LATEST_BUTTON_HEIGHT
+    {
+        return None;
+    }
+
+    let scrollbar_gutter = u16::from(has_scrollbar);
+    Some(Rect {
+        x: area
+            .x
+            .saturating_add(area.width)
+            .saturating_sub(scrollbar_gutter)
+            .saturating_sub(JUMP_TO_LATEST_BUTTON_WIDTH),
+        y: area
+            .y
+            .saturating_add(area.height)
+            .saturating_sub(JUMP_TO_LATEST_BUTTON_HEIGHT),
+        width: JUMP_TO_LATEST_BUTTON_WIDTH,
+        height: JUMP_TO_LATEST_BUTTON_HEIGHT,
+    })
+}
+
+fn render_jump_to_latest_button(
+    area: Rect,
+    buf: &mut Buffer,
+    background: Color,
+    border: Color,
+    arrow: Color,
+) {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(background))
+        .render(area, buf);
+
+    let arrow_x = area.x.saturating_add(1);
+    let arrow_y = area.y.saturating_add(1);
+    buf[(arrow_x, arrow_y)]
+        .set_symbol("↓")
+        .set_style(Style::default().fg(arrow).add_modifier(Modifier::BOLD));
+}
+
 pub struct ComposerWidget<'a> {
     app: &'a App,
     max_height: u16,
-    slash_menu_entries: &'a [String],
+    slash_menu_entries: &'a [SlashMenuEntry],
     mention_menu_entries: &'a [String],
 }
 
@@ -345,7 +441,7 @@ impl<'a> ComposerWidget<'a> {
     pub fn new(
         app: &'a App,
         max_height: u16,
-        slash_menu_entries: &'a [String],
+        slash_menu_entries: &'a [SlashMenuEntry],
         mention_menu_entries: &'a [String],
     ) -> Self {
         Self {
@@ -361,27 +457,13 @@ impl<'a> ComposerWidget<'a> {
     /// a `/cmd` token, not both at once. Mention takes precedence because
     /// the partial-mention check is positional and stricter than slash's
     /// "starts-with-/" check.
-    fn active_menu_entries(&self) -> &'a [String] {
-        if !self.mention_menu_entries.is_empty() {
-            self.mention_menu_entries
-        } else {
-            self.slash_menu_entries
-        }
-    }
-
-    fn active_menu_selected(&self) -> usize {
-        if !self.mention_menu_entries.is_empty() {
-            self.app.mention_menu_selected
-        } else {
-            self.app.slash_menu_selected
-        }
-    }
-
     fn active_menu_row_count(&self) -> usize {
         if self.app.is_history_search_active() {
             self.app.history_search_matches().len().max(1)
+        } else if !self.mention_menu_entries.is_empty() {
+            self.mention_menu_entries.len()
         } else {
-            self.active_menu_entries().len()
+            self.slash_menu_entries.len()
         }
     }
 
@@ -396,7 +478,7 @@ impl<'a> ComposerWidget<'a> {
     /// backend's per-cell write cost makes the layout jitter visible
     /// even though the work is tiny on Unix terminals. See user
     /// feedback in v0.8.8 polish thread.
-    fn active_menu_reserved_rows(&self) -> usize {
+    pub fn active_menu_reserved_rows(&self) -> usize {
         let actual = self.active_menu_row_count();
         if actual == 0 {
             return 0;
@@ -447,12 +529,7 @@ impl Renderable for ComposerWidget<'_> {
         } else {
             Vec::new()
         };
-        let menu_entries = self.active_menu_entries();
-        let menu_lines = if self.app.is_history_search_active() {
-            history_search_matches.len().max(1)
-        } else {
-            menu_entries.len()
-        };
+        let menu_lines = self.active_menu_row_count();
         // For the layout-budget calculation, treat the menu as if it were
         // already at its locked, worst-case height (see
         // `active_menu_reserved_rows`). Without this, when the matched-entry
@@ -462,8 +539,8 @@ impl Renderable for ComposerWidget<'_> {
         let input_rows_budget =
             composer_input_rows_budget(inner_area.height, menu_lines_for_budget);
         let content_width = usize::from(inner_area.width.max(1));
-        let (visible_lines, _cursor_row, _cursor_col) =
-            layout_input(input_text, input_cursor, content_width, input_rows_budget);
+        let (visible_lines, _cursor_row, _cursor_col, scroll_offset) =
+            layout_input_with_scroll(input_text, input_cursor, content_width, input_rows_budget);
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
             let border_color = if input_text.trim().is_empty() {
@@ -512,7 +589,7 @@ impl Renderable for ComposerWidget<'_> {
                     SubmitDisposition::Immediate => {
                         if queue_count > 0 {
                             (
-                                Some(format!("↵ send ({} queued)", queue_count)),
+                                Some(format!("↵ send ({queue_count} queued)")),
                                 palette::DEEPSEEK_SKY,
                             )
                         } else {
@@ -566,19 +643,11 @@ impl Renderable for ComposerWidget<'_> {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
                 .style(background);
-            // Vim mode indicator — shown in the top-right corner of the
-            // composer border when vim editing is active.
-            if self.app.composer.vim_enabled {
-                let color = match self.app.composer.vim_mode {
-                    VimMode::Normal => palette::TEXT_MUTED,
-                    VimMode::Insert => palette::DEEPSEEK_SKY,
-                    VimMode::Visual => palette::MODE_PLAN,
-                };
-                let label = self.app.composer.vim_mode.label();
-                block = block.title_top(
-                    Line::from(Span::styled(label, Style::default().fg(color).bold()))
-                        .right_aligned(),
-                );
+            // Top-right corner: editor state plus transient turn receipts.
+            // Receipts are lifecycle chrome, not transcript content; they
+            // should appear briefly without displacing conversation rows.
+            if let Some(chrome) = composer_top_right_chrome(self.app, area.width) {
+                block = block.title_top(chrome.right_aligned());
             }
             if let Some(hint_line) = hint_line {
                 block = block.title_bottom(hint_line);
@@ -601,6 +670,26 @@ impl Renderable for ComposerWidget<'_> {
                 placeholder,
                 Style::default().fg(palette::TEXT_MUTED).italic(),
             )));
+        } else if let Some((sel_start, sel_end)) = self.app.selection_range() {
+            let line_ranges: Vec<(usize, usize)> =
+                wrap_input_lines_for_mouse(&self.app.input, content_width)
+                    .into_iter()
+                    .skip(scroll_offset)
+                    .take(visible_lines.len())
+                    .map(|(start, text)| (start, start + text.chars().count()))
+                    .collect();
+            for (line_text, (line_start, line_end)) in visible_lines.iter().zip(line_ranges.iter())
+            {
+                let spans = line_spans_with_selection(
+                    line_text,
+                    *line_start,
+                    *line_end,
+                    sel_start,
+                    sel_end,
+                    self.app.ui_theme.selection_bg,
+                );
+                input_lines.push(Line::from(spans));
+            }
         } else {
             for line in &visible_lines {
                 input_lines.push(Line::from(Span::styled(
@@ -689,32 +778,21 @@ impl Renderable for ComposerWidget<'_> {
                     ]));
                 }
             }
-        } else if !menu_entries.is_empty() {
+        } else if !self.mention_menu_entries.is_empty() {
             let selected = self
-                .active_menu_selected()
-                .min(menu_entries.len().saturating_sub(1));
-            // `@`-mention entries get an "@" prefix so the popup line reads
-            // like the actual mention the user is composing.
-            let prefix = if !self.mention_menu_entries.is_empty() {
-                "@"
-            } else {
-                ""
-            };
-
-            // Compute a viewport window into the menu entries so the
-            // selection cursor stays visible even when there are more
-            // entries than available rows.
+                .app
+                .mention_menu_selected
+                .min(self.mention_menu_entries.len().saturating_sub(1));
             let menu_visible_rows = inner_area
                 .height
                 .saturating_sub(visual_rows as u16)
                 .saturating_sub(top_padding as u16)
-                .saturating_sub(1) // at least one row for the cursor
+                .saturating_sub(1)
                 .max(1) as usize;
-            let menu_total = menu_entries.len();
+            let menu_total = self.mention_menu_entries.len();
             let menu_top = if menu_total <= menu_visible_rows {
                 0
             } else {
-                // Keep the selection centered in the viewport.
                 let half = menu_visible_rows / 2;
                 if selected <= half {
                     0
@@ -726,7 +804,8 @@ impl Renderable for ComposerWidget<'_> {
             };
             let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
 
-            for (idx, entry) in menu_entries
+            for (idx, entry) in self
+                .mention_menu_entries
                 .iter()
                 .enumerate()
                 .take(menu_bottom)
@@ -745,7 +824,157 @@ impl Renderable for ComposerWidget<'_> {
                     Span::styled(" ", Style::default()),
                     Span::styled(marker, style),
                     Span::styled(" ", style),
-                    Span::styled(format!("{prefix}{entry}"), style),
+                    Span::styled(format!("@{entry}"), style),
+                ]));
+            }
+        } else if !self.slash_menu_entries.is_empty() {
+            let selected = self
+                .app
+                .slash_menu_selected
+                .min(self.slash_menu_entries.len().saturating_sub(1));
+            let menu_visible_rows = inner_area
+                .height
+                .saturating_sub(visual_rows as u16)
+                .saturating_sub(top_padding as u16)
+                .saturating_sub(1)
+                .max(1) as usize;
+            let menu_total = self.slash_menu_entries.len();
+            let menu_top = if menu_total <= menu_visible_rows {
+                0
+            } else {
+                let half = menu_visible_rows / 2;
+                if selected <= half {
+                    0
+                } else if selected + half >= menu_total {
+                    menu_total.saturating_sub(menu_visible_rows)
+                } else {
+                    selected.saturating_sub(half)
+                }
+            };
+            let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
+
+            // Label column width — grows to fit the widest visible name
+            // (including alias hint like " or /bangzhu") but stays bounded.
+            let label_width = self
+                .slash_menu_entries
+                .iter()
+                .take(menu_bottom)
+                .skip(menu_top)
+                .map(|e| {
+                    if let Some(ref hint) = e.alias_hint {
+                        format!("{} or /{}", e.name, hint).width()
+                    } else {
+                        e.name.width()
+                    }
+                })
+                .max()
+                .unwrap_or(22)
+                .min(content_width.saturating_sub(4))
+                .max(8);
+            for (idx, entry) in self
+                .slash_menu_entries
+                .iter()
+                .enumerate()
+                .take(menu_bottom)
+                .skip(menu_top)
+            {
+                let is_selected = idx == selected;
+                let sel_style = if is_selected {
+                    Style::default()
+                        .fg(palette::SELECTION_TEXT)
+                        .bg(palette::SELECTION_BG)
+                } else {
+                    Style::default().fg(palette::TEXT_MUTED)
+                };
+                let marker = if is_selected { "▸" } else { " " };
+
+                // Name column
+                let name_style = if entry.is_skill && !is_selected {
+                    Style::default().fg(palette::DEEPSEEK_SKY)
+                } else {
+                    sel_style
+                };
+
+                // Description column (muted when not selected, secondary when selected)
+                let desc_style = if is_selected {
+                    Style::default()
+                        .fg(palette::SELECTION_TEXT)
+                        .bg(palette::SELECTION_BG)
+                } else {
+                    Style::default().fg(palette::TEXT_DIM)
+                };
+
+                // Build display name: canonical name, with "or /alias" hint
+                // when the user typed via a pinyin alias.
+                let display_name = if let Some(ref hint) = entry.alias_hint {
+                    format!("{} or /{}", entry.name, hint)
+                } else {
+                    entry.name.clone()
+                };
+
+                let name_display = {
+                    let display_width: usize = display_name.width();
+                    if display_width > label_width {
+                        let mut s = String::new();
+                        let mut w = 0;
+                        for ch in display_name.chars() {
+                            let cw = ch.width().unwrap_or(0);
+                            if w + cw + 1 > label_width {
+                                break;
+                            }
+                            s.push(ch);
+                            w += cw;
+                        }
+                        s.push('…');
+                        // pad to label_width display cols
+                        while s.width() < label_width {
+                            s.push(' ');
+                        }
+                        s
+                    } else {
+                        // pad to label_width display cols
+                        let mut s = display_name;
+                        while s.width() < label_width {
+                            s.push(' ');
+                        }
+                        s
+                    }
+                };
+
+                // Skill marker prefix
+                let skill_prefix = if entry.is_skill { "✦" } else { " " };
+
+                // Compute exact prefix display width to avoid Paragraph wrap:
+                // 1(" ") + 1(marker) + skill_prefix.width() + label_width + 2("  ")
+                let prefix_display_width = 1 + 1 + skill_prefix.width() + label_width + 2;
+                let desc_capacity = content_width.saturating_sub(prefix_display_width);
+                let desc_display = {
+                    let display_width: usize = entry.description.width();
+                    if display_width > desc_capacity && desc_capacity > 0 {
+                        let mut s = String::new();
+                        let mut w = 0;
+                        for ch in entry.description.chars() {
+                            let cw = ch.width().unwrap_or(0);
+                            if w + cw + 1 > desc_capacity {
+                                break;
+                            }
+                            s.push(ch);
+                            w += cw;
+                        }
+                        s.push('…');
+                        s
+                    } else {
+                        entry.description.clone()
+                    }
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(" ", Style::default()),
+                    Span::styled(marker, sel_style),
+                    Span::styled(skill_prefix, name_style),
+                    Span::styled(name_display, name_style),
+                    Span::styled("  ", desc_style),
+                    Span::styled(desc_display, desc_style),
                 ]));
             }
         }
@@ -811,13 +1040,10 @@ impl Renderable for ComposerWidget<'_> {
 
 /// Codex-style full-screen approval takeover (#129).
 ///
-/// The widget reads its mutable state (selected option, staged
-/// confirmation) directly from the [`ApprovalView`] so the destructive
-/// variant can render its "Press Y again to confirm" banner without
-/// touching internal fields. Rendering reflows to fill most of the
-/// transcript area instead of a centered popup; on small terminals it
-/// falls back to a 65×22 card so existing snapshot tests still see a
-/// coherent layout.
+/// The widget reads its selected option and locale directly from the
+/// [`ApprovalView`]. Rendering reflows to fill most of the transcript
+/// area instead of a centered popup; on small terminals it falls back to
+/// a 65×22 card so existing snapshot tests still see a coherent layout.
 pub struct ApprovalWidget<'a> {
     request: &'a ApprovalRequest,
     view: &'a ApprovalView,
@@ -834,18 +1060,54 @@ impl<'a> ApprovalWidget<'a> {
 /// terminal can hold.
 const APPROVAL_CARD_HORIZONTAL_PAD: u16 = 6;
 const APPROVAL_CARD_VERTICAL_PAD: u16 = 2;
-/// Minimum card height — anything tighter and the destructive variant's
-/// confirmation banner overlaps the option list.
+/// Minimum card height — anything tighter and the approval controls
+/// overlap the option list.
 const APPROVAL_CARD_MIN_HEIGHT: u16 = 18;
+/// Minimum card width — anything tighter makes approval copy wrap too
+/// aggressively on small terminals.
+const APPROVAL_CARD_MIN_WIDTH: u16 = 40;
+/// Maximum card height — taller cards stop reading like a focused
+/// takeover and waste vertical space on large terminals.
+const APPROVAL_CARD_MAX_HEIGHT: u16 = 28;
 /// Maximum card width — readability craters past this on wide terminals.
 const APPROVAL_CARD_MAX_WIDTH: u16 = 96;
 
 impl Renderable for ApprovalWidget<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // Collapsed mode: a single-line banner at the bottom of the area
+        // so the user can still see the transcript behind it.
+        if self.view.collapsed {
+            let bar_y = area.y.saturating_add(area.height.saturating_sub(1));
+            let bar_area = Rect::new(area.x, bar_y, area.width, 1);
+            Clear.render(bar_area, buf);
+
+            let risk = self.request.risk;
+            let palette_colors = approval_palette(risk);
+            let summary = format!(
+                " {} — {}  [Tab to expand] ",
+                self.request.tool_name,
+                risk_badge_text(risk, self.view.locale()),
+            );
+            let line = Line::from(Span::styled(
+                summary,
+                Style::default()
+                    .fg(palette::DEEPSEEK_INK)
+                    .bg(palette_colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            Paragraph::new(line).render(bar_area, buf);
+            return;
+        }
+
         let card_area = compute_takeover_area(area);
         Clear.render(card_area, buf);
 
         let risk = self.request.risk;
+        let locale = self.view.locale();
         let palette_colors = approval_palette(risk);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(20);
 
@@ -855,7 +1117,7 @@ impl Renderable for ApprovalWidget<'_> {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!(" {} ", risk_badge_text(risk)),
+                format!(" {} ", risk_badge_text(risk, locale)),
                 Style::default()
                     .fg(palette::DEEPSEEK_INK)
                     .bg(palette_colors.accent)
@@ -870,12 +1132,12 @@ impl Renderable for ApprovalWidget<'_> {
             ),
         ]));
 
-        // Category line — unchanged vocabulary so existing tests still
-        // recognise the rendering.
-        let (cat_label, cat_color) = category_label_for(self.request.category);
+        // Category line — English remains the baseline while localized
+        // sessions get the same risk category in their UI language.
+        let (cat_label, cat_color) = category_label_for(self.request.category, locale);
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("Type: ", Style::default().fg(palette::TEXT_HINT)),
+            Span::styled(label_type(locale), Style::default().fg(palette::TEXT_HINT)),
             Span::styled(
                 cat_label,
                 Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
@@ -887,17 +1149,20 @@ impl Renderable for ApprovalWidget<'_> {
         // they tell the user what will happen.
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("About:  ", Style::default().fg(palette::TEXT_HINT)),
+            Span::styled(label_about(locale), Style::default().fg(palette::TEXT_HINT)),
             Span::styled(
-                self.request.description.clone(),
+                self.request.description_for_locale(locale),
                 Style::default().fg(palette::TEXT_BODY),
             ),
         ]));
-        for impact in self.request.impacts.iter().take(4) {
+        for impact in self.request.impacts_for_locale(locale).into_iter().take(4) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("Impact: ", Style::default().fg(palette::TEXT_HINT)),
-                Span::styled(impact.clone(), Style::default().fg(palette::TEXT_BODY)),
+                Span::styled(
+                    label_impact(locale),
+                    Style::default().fg(palette::TEXT_HINT),
+                ),
+                Span::styled(impact, Style::default().fg(palette::TEXT_BODY)),
             ]));
         }
 
@@ -908,7 +1173,10 @@ impl Renderable for ApprovalWidget<'_> {
             crate::utils::truncate_with_ellipsis(&params_str, params_width.max(20), "...");
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("Params: ", Style::default().fg(palette::TEXT_HINT)),
+            Span::styled(
+                label_params(locale),
+                Style::default().fg(palette::TEXT_HINT),
+            ),
             Span::styled(
                 params_truncated,
                 Style::default().fg(palette::TEXT_SECONDARY),
@@ -917,123 +1185,55 @@ impl Renderable for ApprovalWidget<'_> {
 
         lines.push(Line::from(""));
 
-        let options = approval_options_for(risk);
-        let pending = self.view.pending_confirm();
+        let options = approval_options_for(risk, locale);
 
         for (i, opt) in options.iter().enumerate() {
             let is_selected = i == self.view.selected();
-            let staged = pending.is_some_and(|p| p == opt.option);
             let label_color = if opt.dangerous {
                 palette_colors.accent
             } else {
                 palette::TEXT_BODY
             };
 
-            let row_style = if is_selected {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-            } else {
-                Style::default()
-            };
+            let option_style = approval_option_style(is_selected, label_color);
+            let shortcut_style = approval_option_style(is_selected, palette_colors.shortcut);
 
-            let mut spans = vec![
+            let spans = vec![
                 Span::raw("  "),
                 Span::styled(
                     format!("[{}] ", opt.key_hint),
-                    Style::default()
-                        .fg(palette_colors.shortcut)
-                        .add_modifier(Modifier::BOLD),
+                    shortcut_style.add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(opt.label.to_string(), row_style.fg(label_color)),
+                Span::styled(opt.label.to_string(), option_style),
             ];
-            if staged {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    "(staged)",
-                    Style::default()
-                        .fg(palette_colors.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
             lines.push(Line::from(spans));
         }
 
-        // Variant-specific footer: benign nudges single-key approve;
-        // destructive shows either the standing prompt or the
-        // confirmation banner when an approve key has been staged.
+        // Footer: Enter commits the highlighted row; y/a/d remain direct
+        // shortcuts for users who do not want to move the selection.
         lines.push(Line::from(""));
-        match (risk, pending) {
-            (RiskLevel::Benign, _) => {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        "Single key approves: ",
-                        Style::default().fg(palette::TEXT_HINT),
-                    ),
-                    Span::styled(
-                        "Enter / 1 / y",
-                        Style::default()
-                            .fg(palette_colors.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "  ·  v: full params  ·  Esc: abort",
-                        Style::default().fg(palette::TEXT_HINT),
-                    ),
-                ]));
-            }
-            (RiskLevel::Destructive, Some(opt)) => {
-                let again_key = match opt {
-                    crate::tui::approval::ApprovalOption::ApproveOnce => "Enter or y",
-                    crate::tui::approval::ApprovalOption::ApproveAlways => "Enter or a",
-                    _ => "Enter",
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        "Confirm destructive action — press ",
-                        Style::default()
-                            .fg(palette_colors.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        again_key.to_string(),
-                        Style::default()
-                            .fg(palette::DEEPSEEK_INK)
-                            .bg(palette_colors.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        " again to commit, anything else cancels.",
-                        Style::default().fg(palette::TEXT_HINT),
-                    ),
-                ]));
-            }
-            (RiskLevel::Destructive, None) => {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        "Two keys to approve: ",
-                        Style::default().fg(palette::TEXT_HINT),
-                    ),
-                    Span::styled(
-                        "y/a then y/a again",
-                        Style::default()
-                            .fg(palette_colors.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "  ·  v: full params  ·  Esc: abort",
-                        Style::default().fg(palette::TEXT_HINT),
-                    ),
-                ]));
-            }
-        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                selection_hint_prefix(locale),
+                Style::default().fg(palette::TEXT_HINT),
+            ),
+            Span::styled(
+                selection_hint_value(locale),
+                Style::default()
+                    .fg(palette_colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                footer_controls(locale),
+                Style::default().fg(palette::TEXT_HINT),
+            ),
+        ]));
 
         let title = format!(
-            " {} approval — {} ",
-            risk_badge_text(risk),
+            " {} {} — {} ",
+            risk_badge_text(risk, locale),
+            approval_word(locale),
             self.request.tool_name
         );
         let block = Block::default()
@@ -1063,12 +1263,18 @@ impl Renderable for ApprovalWidget<'_> {
 
 /// Compute the card rect inside `area`. Always centered; pad on every
 /// side so the takeover reads as a takeover but a small terminal still
-/// renders the full card without truncation.
+/// stays inside the buffer. Very small terminals may truncate the card
+/// content, but rendering must never address cells outside `area`.
 fn compute_takeover_area(area: Rect) -> Rect {
     let avail_width = area.width.saturating_sub(APPROVAL_CARD_HORIZONTAL_PAD * 2);
     let avail_height = area.height.saturating_sub(APPROVAL_CARD_VERTICAL_PAD * 2);
-    let card_width = APPROVAL_CARD_MAX_WIDTH.min(avail_width).max(40);
-    let card_height = APPROVAL_CARD_MIN_HEIGHT.max(avail_height.min(28));
+    let card_width = APPROVAL_CARD_MAX_WIDTH
+        .min(avail_width)
+        .max(APPROVAL_CARD_MIN_WIDTH)
+        .min(area.width);
+    let card_height = APPROVAL_CARD_MIN_HEIGHT
+        .max(avail_height.min(APPROVAL_CARD_MAX_HEIGHT))
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(card_width)) / 2;
     let y = area.y + (area.height.saturating_sub(card_height)) / 2;
     Rect {
@@ -1120,61 +1326,163 @@ fn approval_palette(risk: RiskLevel) -> ApprovalColors {
     }
 }
 
-fn risk_badge_text(risk: RiskLevel) -> &'static str {
-    match risk {
-        RiskLevel::Benign => "REVIEW",
-        RiskLevel::Destructive => "DESTRUCTIVE",
+fn approval_selected_style() -> Style {
+    Style::default()
+        .fg(palette::SELECTION_TEXT)
+        .bg(palette::DEEPSEEK_BLUE)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn approval_option_style(is_selected: bool, color: Color) -> Style {
+    if is_selected {
+        approval_selected_style()
+    } else {
+        Style::default().fg(color)
     }
 }
 
-fn category_label_for(category: ToolCategory) -> (&'static str, Color) {
-    match category {
-        ToolCategory::Safe => ("Safe", palette::STATUS_SUCCESS),
-        ToolCategory::FileWrite => ("File Write", palette::STATUS_WARNING),
-        ToolCategory::Shell => ("Shell Command", palette::STATUS_ERROR),
-        ToolCategory::Network => ("Network", palette::STATUS_WARNING),
-        ToolCategory::McpRead => ("MCP Read", palette::DEEPSEEK_SKY),
-        ToolCategory::McpAction => ("MCP Action", palette::STATUS_WARNING),
-        ToolCategory::Unknown => ("Unknown", palette::STATUS_ERROR),
+fn risk_badge_text(risk: RiskLevel, locale: Locale) -> &'static str {
+    match (locale, risk) {
+        (Locale::ZhHans, RiskLevel::Benign) => "审查",
+        (Locale::ZhHans, RiskLevel::Destructive) => "破坏性",
+        (_, RiskLevel::Benign) => "REVIEW",
+        (_, RiskLevel::Destructive) => "DESTRUCTIVE",
+    }
+}
+
+fn category_label_for(category: ToolCategory, locale: Locale) -> (&'static str, Color) {
+    match (locale, category) {
+        (Locale::ZhHans, ToolCategory::Safe) => ("安全", palette::STATUS_SUCCESS),
+        (Locale::ZhHans, ToolCategory::FileWrite) => ("文件写入", palette::STATUS_WARNING),
+        (Locale::ZhHans, ToolCategory::Shell) => ("Shell 命令", palette::STATUS_ERROR),
+        (Locale::ZhHans, ToolCategory::Network) => ("网络", palette::STATUS_WARNING),
+        (Locale::ZhHans, ToolCategory::McpRead) => ("MCP 读取", palette::DEEPSEEK_SKY),
+        (Locale::ZhHans, ToolCategory::McpAction) => ("MCP 操作", palette::STATUS_WARNING),
+        (Locale::ZhHans, ToolCategory::Unknown) => ("未知", palette::STATUS_ERROR),
+        (_, ToolCategory::Safe) => ("Safe", palette::STATUS_SUCCESS),
+        (_, ToolCategory::FileWrite) => ("File Write", palette::STATUS_WARNING),
+        (_, ToolCategory::Shell) => ("Shell Command", palette::STATUS_ERROR),
+        (_, ToolCategory::Network) => ("Network", palette::STATUS_WARNING),
+        (_, ToolCategory::McpRead) => ("MCP Read", palette::DEEPSEEK_SKY),
+        (_, ToolCategory::McpAction) => ("MCP Action", palette::STATUS_WARNING),
+        (_, ToolCategory::Unknown) => ("Unknown", palette::STATUS_ERROR),
+    }
+}
+
+fn approval_word(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "审批",
+        _ => "approval",
+    }
+}
+
+fn label_type(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "类型：",
+        _ => "Type: ",
+    }
+}
+
+fn label_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "说明：",
+        _ => "About:  ",
+    }
+}
+
+fn label_impact(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "影响：",
+        _ => "Impact: ",
+    }
+}
+
+fn label_params(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "参数：",
+        _ => "Params: ",
+    }
+}
+
+fn footer_controls(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "  ·  v：完整参数  ·  Esc：终止",
+        _ => "  ·  v: full params  ·  Esc: abort",
+    }
+}
+
+fn selection_hint_prefix(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "选择：",
+        _ => "Choose: ",
+    }
+}
+
+fn selection_hint_value(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "Enter 执行选中项，或直接按 y/a/d",
+        _ => "Enter selected option, or press y/a/d directly",
     }
 }
 
 struct ApprovalOptionRow {
-    option: crate::tui::approval::ApprovalOption,
     label: &'static str,
     key_hint: &'static str,
     dangerous: bool,
 }
 
-fn approval_options_for(risk: RiskLevel) -> [ApprovalOptionRow; 4] {
-    use crate::tui::approval::ApprovalOption as O;
+fn approval_options_for(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 4] {
     let dangerous = matches!(risk, RiskLevel::Destructive);
     [
         ApprovalOptionRow {
-            option: O::ApproveOnce,
-            label: "Approve once",
+            label: option_approve_once(locale),
             key_hint: "1 / y",
             dangerous,
         },
         ApprovalOptionRow {
-            option: O::ApproveAlways,
-            label: "Approve always for this kind",
+            label: option_approve_always(locale),
             key_hint: "2 / a",
             dangerous,
         },
         ApprovalOptionRow {
-            option: O::Deny,
-            label: "Deny this call",
+            label: option_deny(locale),
             key_hint: "3 / d / n",
             dangerous: false,
         },
         ApprovalOptionRow {
-            option: O::Abort,
-            label: "Abort the turn",
+            label: option_abort(locale),
             key_hint: "Esc",
             dangerous: false,
         },
     ]
+}
+
+fn option_approve_once(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "仅本次批准",
+        _ => "Approve once",
+    }
+}
+
+fn option_approve_always(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "本会话同类自动批准",
+        _ => "Approve always for this kind",
+    }
+}
+
+fn option_deny(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "拒绝本次调用",
+        _ => "Deny this call",
+    }
+}
+
+fn option_abort(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "终止本轮",
+        _ => "Abort the turn",
+    }
 }
 
 pub struct ElevationWidget<'a> {
@@ -1507,6 +1815,114 @@ fn char_display_width(ch: char) -> usize {
     }
 }
 
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    let limit = max_width.saturating_sub(3);
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn vim_mode_style(mode: VimMode) -> Style {
+    let color = match mode {
+        VimMode::Normal => palette::TEXT_MUTED,
+        VimMode::Insert => palette::DEEPSEEK_SKY,
+        VimMode::Visual => palette::MODE_PLAN,
+    };
+    Style::default().fg(color).bold()
+}
+
+fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>> {
+    let receipt = app.active_receipt_text();
+    let session_title = app.session_title.as_deref();
+    if !app.composer.vim_enabled && receipt.is_none() && session_title.is_none() {
+        return None;
+    }
+
+    // Leave room for the left title and both borders. On narrow panes, skip
+    // extra chrome rather than letting status text collide with "Composer".
+    let max_width = usize::from(area_width.saturating_sub(18));
+    if max_width < 4 {
+        return None;
+    }
+
+    let receipt_style = Style::default()
+        .fg(palette::STATUS_SUCCESS)
+        .add_modifier(Modifier::DIM);
+    if let Some(receipt) = receipt {
+        let receipt_text = receipt.trim();
+        if app.composer.vim_enabled {
+            let vim_label = app.composer.vim_mode.label();
+            let vim_width = UnicodeWidthStr::width(vim_label);
+            let sep_width = UnicodeWidthStr::width(" · ");
+            if vim_width + sep_width + 4 <= max_width {
+                let receipt_width = max_width.saturating_sub(vim_width + sep_width);
+                return Some(Line::from(vec![
+                    Span::styled(vim_label.to_string(), vim_mode_style(app.composer.vim_mode)),
+                    Span::styled(" · ", Style::default().fg(palette::TEXT_MUTED)),
+                    Span::styled(
+                        truncate_display_width(receipt_text, receipt_width),
+                        receipt_style,
+                    ),
+                ]));
+            }
+        }
+
+        return Some(Line::from(Span::styled(
+            truncate_display_width(receipt_text, max_width),
+            receipt_style,
+        )));
+    }
+
+    let mut spans: Vec<Span> = Vec::new();
+    if app.composer.vim_enabled {
+        spans.push(Span::styled(
+            truncate_display_width(app.composer.vim_mode.label(), max_width),
+            vim_mode_style(app.composer.vim_mode),
+        ));
+    }
+    if let Some(title) = session_title {
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let sep = if spans.is_empty() { 0 } else { 2 };
+        let remaining = max_width.saturating_sub(used + sep);
+        if remaining >= 4 {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                truncate_display_width(title, remaining),
+                Style::default().fg(palette::TEXT_MUTED),
+            ));
+        }
+    }
+    if spans.is_empty() {
+        None
+    } else {
+        Some(Line::from(spans))
+    }
+}
+
 fn should_render_empty_state(app: &App) -> bool {
     app.history.is_empty() && !app.is_loading && !app.is_compacting
 }
@@ -1516,29 +1932,29 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         return Vec::new();
     }
 
-    let workspace_name = app
-        .workspace
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| app.workspace.to_string_lossy().into_owned());
+    let workspace = crate::utils::display_path(&app.workspace);
     let body_width = usize::from(area.width.saturating_sub(8).clamp(24, 72));
     let left_padding = usize::from(area.width.saturating_sub(body_width as u16) / 2);
     let inset = " ".repeat(left_padding);
 
     let body = vec![
         Line::from(Span::styled(
-            format!("{inset}DeepSeek TUI"),
+            format!("{inset}>_ codewhale (v{})", env!("CARGO_PKG_VERSION")),
             Style::default().fg(palette::DEEPSEEK_BLUE).bold(),
         )),
+        Line::from(""),
         Line::from(Span::styled(
-            format!("{inset}{workspace_name}  ·  {}", app.model),
+            format!("{inset}model: {}  /model to switch", app.model),
+            Style::default().fg(palette::TEXT_MUTED),
+        )),
+        Line::from(Span::styled(
+            format!("{inset}directory: {workspace}"),
             Style::default().fg(palette::TEXT_MUTED),
         )),
     ];
 
-    let top_padding = usize::from(area.height.saturating_sub(body.len() as u16) / 3);
+    // Keep the welcome block near the top of the chat pane (header is separate).
+    let top_padding = 2usize;
     let mut lines = Vec::new();
     for _ in 0..top_padding {
         lines.push(Line::from(""));
@@ -1547,7 +1963,7 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     lines
 }
 
-fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usize {
+pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usize {
     usize::from(inner_height).saturating_sub(extra_lines).max(1)
 }
 
@@ -1618,24 +2034,310 @@ fn composer_height(
     line_count.clamp(1, max_height).try_into().unwrap_or(1)
 }
 
-pub(crate) fn slash_completion_hints(input: &str, limit: usize) -> Vec<String> {
-    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+/// A single entry in the slash-command autocomplete popup.
+pub(crate) struct SlashMenuEntry {
+    pub name: String,
+    pub description: String,
+    pub is_skill: bool,
+    /// Matching pinyin/alias prefix hint, e.g. when user types `/bang` and
+    /// the command `/help` matches via alias `bangzhu`.
+    pub alias_hint: Option<String>,
+}
+
+/// Check if all characters in `needle` appear in `haystack` in order
+/// (subsequence matching — fuzzy filtering).
+fn fuzzy_chars_in_order(needle: &str, haystack: &str) -> bool {
+    let mut chars = needle.chars();
+    let mut current = match chars.next() {
+        Some(c) => c,
+        None => return true,
+    };
+    for ch in haystack.chars() {
+        if ch == current {
+            if let Some(next) = chars.next() {
+                current = next;
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn slash_completion_hints(
+    input: &str,
+    limit: usize,
+    cached_skills: &[(String, String)],
+    locale: crate::localization::Locale,
+    workspace: Option<&std::path::Path>,
+    api_provider: ApiProvider,
+) -> Vec<SlashMenuEntry> {
+    if !super::app::looks_like_slash_command_input(input) {
         return Vec::new();
     }
 
     let prefix = input.trim_start_matches('/');
-    let mut hints = commands::all_command_names_matching(prefix);
+    let completing_skill_arg = prefix.strip_prefix("skill ").map(str::trim_start);
+    if input.contains(char::is_whitespace) && completing_skill_arg.is_none() {
+        return Vec::new();
+    }
+    let mut entries: Vec<SlashMenuEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let user_commands = if completing_skill_arg.is_none() {
+        commands::user_commands::load_user_commands(workspace)
+    } else {
+        Vec::new()
+    };
 
-    if hints.is_empty() && prefix.eq_ignore_ascii_case("model") {
-        hints = COMMON_DEEPSEEK_MODELS
-            .iter()
-            .map(|name| format!("/model {name}"))
-            .collect();
+    // ── Phase 1: prefix (starts_with) matches ─────────────────────────
+    // Highest priority — preserves existing exact-prefix completion.
+    if completing_skill_arg.is_none() {
+        for name in all_command_names_matching_loaded(prefix, &user_commands) {
+            seen.insert(name.clone());
+            let command_key = name.trim_start_matches('/');
+            push_command_entry(
+                &mut entries,
+                &name,
+                command_key,
+                &prefix_lower,
+                locale,
+                &user_commands,
+            );
+        }
     }
 
-    hints.sort();
-    hints.dedup();
-    hints.into_iter().take(limit).collect()
+    // ── Phase 2: contains (substring) matches ─────────────────────────
+    // Medium priority — broader catching.
+    if completing_skill_arg.is_none() {
+        for cmd in commands::COMMANDS {
+            let name = format!("/{}", cmd.name);
+            if seen.contains(&name) {
+                continue;
+            }
+            let cmd_lower = cmd.name.to_ascii_lowercase();
+            let alias_match = cmd
+                .aliases
+                .iter()
+                .any(|a| a.to_ascii_lowercase().contains(&prefix_lower));
+            if cmd_lower.contains(&prefix_lower) || alias_match {
+                seen.insert(name.clone());
+                push_command_entry(
+                    &mut entries,
+                    &name,
+                    cmd.name,
+                    &prefix_lower,
+                    locale,
+                    &user_commands,
+                );
+            }
+        }
+    }
+
+    // ── Phase 3: fuzzy subsequence matches ────────────────────────────
+    // Lowest priority — characters in order, not necessarily consecutive.
+    if completing_skill_arg.is_none() {
+        for cmd in commands::COMMANDS {
+            let name = format!("/{}", cmd.name);
+            if seen.contains(&name) {
+                continue;
+            }
+            let cmd_lower = cmd.name.to_ascii_lowercase();
+            let alias_match = cmd
+                .aliases
+                .iter()
+                .any(|a| fuzzy_chars_in_order(&prefix_lower, &a.to_ascii_lowercase()));
+            if fuzzy_chars_in_order(&prefix_lower, &cmd_lower) || alias_match {
+                seen.insert(name.clone());
+                push_command_entry(
+                    &mut entries,
+                    &name,
+                    cmd.name,
+                    &prefix_lower,
+                    locale,
+                    &user_commands,
+                );
+            }
+        }
+    }
+
+    // ── Skills (only after user has typed `/skill `) ──────────────────
+    let skill_prefix = completing_skill_arg.unwrap_or(prefix).to_ascii_lowercase();
+    if completing_skill_arg.is_some() {
+        for (skill_name, skill_desc) in cached_skills {
+            let skill_name_lower = skill_name.to_ascii_lowercase();
+            if skill_name_lower.starts_with(&skill_prefix) {
+                entries.push(SlashMenuEntry {
+                    name: format!("/skill {skill_name}"),
+                    description: skill_desc.clone(),
+                    is_skill: true,
+                    alias_hint: None,
+                });
+            }
+        }
+        // Skills: contains fuzzy fallback
+        for (skill_name, skill_desc) in cached_skills {
+            let skill_name_lower = skill_name.to_ascii_lowercase();
+            if skill_name_lower.contains(&skill_prefix)
+                && !entries
+                    .iter()
+                    .any(|e| e.name == format!("/skill {skill_name}"))
+            {
+                entries.push(SlashMenuEntry {
+                    name: format!("/skill {skill_name}"),
+                    description: skill_desc.clone(),
+                    is_skill: true,
+                    alias_hint: None,
+                });
+            }
+        }
+        for (skill_name, skill_desc) in cached_skills {
+            let skill_name_lower = skill_name.to_ascii_lowercase();
+            if !skill_name_lower.starts_with(&skill_prefix)
+                && !skill_name_lower.contains(&skill_prefix)
+                && fuzzy_chars_in_order(&skill_prefix, &skill_name_lower)
+            {
+                entries.push(SlashMenuEntry {
+                    name: format!("/skill {skill_name}"),
+                    description: skill_desc.clone(),
+                    is_skill: true,
+                    alias_hint: None,
+                });
+            }
+        }
+    }
+
+    // Special: /model <name> completions when only /model matches
+    if entries.iter().any(|e| e.name == "/model") && prefix_lower.eq_ignore_ascii_case("model") {
+        for model_name in model_completion_names_for_provider(api_provider) {
+            entries.push(SlashMenuEntry {
+                name: format!("/model {model_name}"),
+                description: String::from("Switch to this model"),
+                is_skill: false,
+                alias_hint: None,
+            });
+        }
+    }
+
+    // Rank exact-alias matches above prefix/alias matches so e.g. typing
+    // `/q` ranks `/exit` (alias `q` is an exact hit) above `/clear` (alias
+    // `qingping` only matches by prefix). Inside each tier, fall back to
+    // alphabetical name order for deterministic display (#1811).
+    let rank = |entry: &SlashMenuEntry| -> u8 {
+        if entry.is_skill {
+            return 3;
+        }
+        let command_key = entry.name.trim_start_matches('/');
+        if command_key.eq_ignore_ascii_case(&prefix_lower) {
+            return 0;
+        }
+        if let Some(info) = commands::get_command_info(command_key)
+            && info
+                .aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&prefix_lower))
+        {
+            return 0;
+        }
+        if command_key.to_ascii_lowercase().starts_with(&prefix_lower) {
+            return 1;
+        }
+        2
+    };
+    entries.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name)));
+    entries.dedup_by(|a, b| a.name == b.name);
+    entries.into_iter().take(limit).collect()
+}
+
+fn all_command_names_matching_loaded(
+    prefix: &str,
+    user_commands: &[(String, String)],
+) -> Vec<String> {
+    let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
+    let mut result: Vec<String> = commands::COMMANDS
+        .iter()
+        .filter(|cmd| {
+            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
+        })
+        .map(|cmd| format!("/{}", cmd.name))
+        .collect();
+
+    result.extend(
+        user_commands
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(name, _)| format!("/{name}")),
+    );
+
+    result.sort();
+    result.dedup();
+    result
+}
+
+/// Push a built-in command entry to the slash menu, resolving description
+/// and alias hints.
+fn push_command_entry(
+    entries: &mut Vec<SlashMenuEntry>,
+    name: &str,
+    command_key: &str,
+    prefix_lower: &str,
+    locale: crate::localization::Locale,
+    user_commands: &[(String, String)],
+) {
+    let (description, alias_hint) = if let Some(info) = commands::get_command_info(command_key) {
+        let hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
+            info.aliases
+                .iter()
+                .find(|a| {
+                    a.to_ascii_lowercase().starts_with(prefix_lower)
+                        || a.to_ascii_lowercase().contains(prefix_lower)
+                        || fuzzy_chars_in_order(prefix_lower, &a.to_ascii_lowercase())
+                })
+                .map(|a| a.to_string())
+        } else {
+            None
+        };
+        let desc = if info.aliases.is_empty() {
+            info.description_for(locale).to_string()
+        } else {
+            format!(
+                "{}  (aliases: {})",
+                info.description_for(locale),
+                info.aliases
+                    .iter()
+                    .map(|a| format!("/{a}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        (desc, hint)
+    } else {
+        let mut description = String::from("User-defined command");
+        let mut argument_hint = None;
+        if let Some((_, content)) = user_commands.iter().find(|(key, _)| key == command_key) {
+            let (metadata, _) = commands::user_commands::parse_frontmatter(content);
+            for (key, value) in metadata {
+                match key.as_str() {
+                    "description" => description = value,
+                    "argument-hint" => argument_hint = Some(value),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(hint) = argument_hint {
+            if !hint.trim().is_empty() {
+                description.push_str("  ");
+                description.push_str(hint.trim());
+            }
+        }
+        (description, None)
+    };
+    entries.push(SlashMenuEntry {
+        name: name.to_string(),
+        description,
+        is_skill: false,
+        alias_hint,
+    });
 }
 
 fn layout_input(
@@ -1644,6 +2346,17 @@ fn layout_input(
     width: usize,
     max_height: usize,
 ) -> (Vec<String>, usize, usize) {
+    let (visible, visible_cursor_row, visible_cursor_col, _) =
+        layout_input_with_scroll(input, cursor, width, max_height);
+    (visible, visible_cursor_row, visible_cursor_col)
+}
+
+pub fn layout_input_with_scroll(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    max_height: usize,
+) -> (Vec<String>, usize, usize, usize) {
     let mut lines = wrap_input_lines(input, width);
     if lines.is_empty() {
         lines.push(String::new());
@@ -1669,6 +2382,7 @@ fn layout_input(
         visible,
         visible_cursor_row,
         cursor_col.min(width.saturating_sub(1)),
+        start,
     )
 }
 
@@ -1735,6 +2449,34 @@ fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// For mouse coordinate mapping: returns (char_start_of_line, line_text) pairs
+/// matching the wrapping produced by `wrap_input_lines`.
+pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, String)> {
+    if input.is_empty() || width == 0 {
+        return vec![(0, String::new())];
+    }
+
+    let mut result = Vec::new();
+    let mut char_idx = 0usize;
+
+    for raw_line in input.split('\n') {
+        if raw_line.is_empty() {
+            result.push((char_idx, String::new()));
+            char_idx += 1; // the '\n'
+            continue;
+        }
+        let wrapped = wrap_text(raw_line, width);
+        for wrapped_line in &wrapped {
+            let line_char_len: usize = wrapped_line.chars().count();
+            result.push((char_idx, wrapped_line.clone()));
+            char_idx += line_char_len;
+        }
+        char_idx += 1; // the '\n'
+    }
+
+    result
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -1776,19 +2518,72 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn line_spans_with_selection<'a>(
+    line: &'a str,
+    line_start: usize,
+    line_end: usize,
+    sel_start: usize,
+    sel_end: usize,
+    highlight_bg: Color,
+) -> Vec<Span<'a>> {
+    let normal_style = Style::default().fg(palette::TEXT_PRIMARY);
+    let sel_style = Style::default().fg(palette::TEXT_PRIMARY).bg(highlight_bg);
+
+    // No overlap between this line and the selection
+    if line_end <= sel_start || line_start >= sel_end {
+        return vec![Span::styled(line, normal_style)];
+    }
+
+    let local_sel_start = sel_start.saturating_sub(line_start);
+    let local_sel_end = sel_end.min(line_end).saturating_sub(line_start);
+
+    // Build a Vec of byte offsets for each char boundary, plus one past the end.
+    let mut byte_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
+    byte_offsets.push(line.len());
+
+    let b0 = byte_offsets
+        .get(local_sel_start)
+        .copied()
+        .unwrap_or(line.len());
+    let b1 = byte_offsets
+        .get(local_sel_end)
+        .copied()
+        .unwrap_or(line.len());
+
+    let mut spans = Vec::with_capacity(3);
+
+    // Text before selection
+    if b0 > 0 {
+        spans.push(Span::styled(&line[..b0], normal_style));
+    }
+    // Selected text
+    if b1 > b0 {
+        spans.push(Span::styled(&line[b0..b1], sel_style));
+    }
+    // Text after selection
+    if b1 < line.len() {
+        spans.push(Span::styled(&line[b1..], normal_style));
+    }
+
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSER_PANEL_HEIGHT, ChatWidget, ComposerWidget, Renderable, apply_selection_to_line,
-        composer_height, composer_max_height, composer_min_input_rows, composer_top_padding,
+        ApprovalWidget, COMPOSER_PANEL_HEIGHT, ChatWidget, ComposerWidget, Renderable,
+        SlashMenuEntry, apply_selection_to_line, build_empty_state_lines, composer_height,
+        composer_max_height, composer_min_input_rows, composer_top_padding, compute_takeover_area,
         cursor_row_col, layout_input, pad_lines_to_bottom, placeholder_visual_lines,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
+        push_command_entry, should_render_empty_state, slash_completion_hints, wrap_input_lines,
+        wrap_text,
     };
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::app::{App, ComposerDensity, TuiOptions};
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::scrolling::TranscriptScroll;
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -1821,6 +2616,17 @@ mod tests {
             initial_input: None,
         };
         App::new(options, &Config::default())
+    }
+
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
@@ -1974,16 +2780,238 @@ mod tests {
 
     #[test]
     fn slash_completion_hints_include_links_and_config() {
-        let hints = slash_completion_hints("/", 128);
-        assert!(hints.iter().any(|hint| hint == "/config"));
-        assert!(hints.iter().any(|hint| hint == "/links"));
+        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        assert!(hints.iter().any(|hint| hint.name == "/config"));
+        assert!(hints.iter().any(|hint| hint.name == "/links"));
+    }
+
+    #[test]
+    fn slash_completion_hints_rank_exact_alias_above_prefix_alias() {
+        // `/q` should rank `/exit` (exact alias `q`) above `/clear` (alias
+        // `qingping` only matches by prefix). Before #1811 the entries were
+        // sorted alphabetically, so `/clear` shadowed `/exit` even though
+        // the user typed the exact alias for `/exit`.
+        let hints = slash_completion_hints("/q", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let names: Vec<&str> = hints.iter().map(|h| h.name.as_str()).collect();
+        let exit_pos = names
+            .iter()
+            .position(|n| *n == "/exit")
+            .expect("/exit should appear when typing /q (alias `q`)");
+        let clear_pos = names
+            .iter()
+            .position(|n| *n == "/clear")
+            .expect("/clear should still appear when typing /q (alias `qingping`)");
+        assert!(
+            exit_pos < clear_pos,
+            "expected /exit to rank above /clear for prefix /q, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn slash_completion_hints_keep_prefix_match_alphabetical_within_tier() {
+        // Within the same rank tier (no exact-alias match), entries fall
+        // back to alphabetical name order, same as the prior behavior.
+        let hints =
+            slash_completion_hints("/co", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let names: Vec<&str> = hints
+            .iter()
+            .map(|h| h.name.as_str())
+            .filter(|n| n.starts_with("/co"))
+            .collect();
+        let sorted = {
+            let mut copy = names.clone();
+            copy.sort();
+            copy
+        };
+        assert_eq!(
+            names, sorted,
+            "tied entries (no exact-alias match) should stay alphabetical"
+        );
     }
 
     #[test]
     fn slash_completion_hints_exclude_set_and_deepseek_commands() {
-        let hints = slash_completion_hints("/", 128);
-        assert!(!hints.iter().any(|hint| hint == "/set"));
-        assert!(!hints.iter().any(|hint| hint == "/deepseek"));
+        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        assert!(!hints.iter().any(|hint| hint.name == "/set"));
+        assert!(!hints.iter().any(|hint| hint.name == "/codewhale"));
+    }
+
+    #[test]
+    fn slash_completion_hints_use_user_command_frontmatter_description() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".deepseek").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("git-scan.md"),
+            "---\ndescription: Scan nested git repositories\n---\nscan",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/git",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/git-scan")
+            .expect("custom command should be present");
+        assert_eq!(entry.description, "Scan nested git repositories");
+    }
+
+    #[test]
+    fn slash_completion_hints_use_user_command_argument_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".deepseek").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("deploy.md"),
+            "---\ndescription: Deploy target\nargument-hint: <env>\n---\ndeploy",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/deploy",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/deploy")
+            .expect("custom command should be present");
+        assert_eq!(entry.description, "Deploy target  <env>");
+    }
+
+    #[test]
+    fn review_regression_push_command_entry_uses_preloaded_user_command_frontmatter() {
+        let user_commands = vec![(
+            "deploy".to_string(),
+            "---\ndescription: Deploy target\nargument-hint: <env>\n---\ndeploy".to_string(),
+        )];
+        let mut entries = Vec::new();
+
+        push_command_entry(
+            &mut entries,
+            "/deploy",
+            "deploy",
+            "deploy",
+            Locale::En,
+            &user_commands,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/deploy");
+        assert_eq!(entries[0].description, "Deploy target  <env>");
+    }
+
+    #[test]
+    fn slash_completion_hints_hide_skills_from_top_level_menu() {
+        let cached_skills = vec![
+            ("search-files".to_string(), "Search files".to_string()),
+            ("my-review".to_string(), "Review code".to_string()),
+        ];
+        let hints = slash_completion_hints(
+            "/",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
+        assert!(hints.iter().any(|hint| hint.name == "/skill"));
+        assert!(hints.iter().any(|hint| hint.name == "/skills"));
+        assert!(!hints.iter().any(|hint| hint.is_skill));
+    }
+
+    #[test]
+    fn slash_completion_hints_hide_skills_from_top_level_prefix() {
+        let cached_skills = vec![
+            ("search-files".to_string(), "Search files".to_string()),
+            ("my-review".to_string(), "Review code".to_string()),
+        ];
+        let hints = slash_completion_hints(
+            "/se",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
+        assert!(!hints.iter().any(|hint| hint.name == "/skill search-files"));
+        assert!(!hints.iter().any(|hint| hint.name == "/skill my-review"));
+    }
+
+    #[test]
+    fn slash_completion_hints_complete_skill_argument_all() {
+        let cached_skills = vec![
+            ("search-files".to_string(), "Search files".to_string()),
+            ("my-review".to_string(), "Review code".to_string()),
+        ];
+        let hints = slash_completion_hints(
+            "/skill ",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().any(|hint| hint.name == "/skill search-files"));
+        assert!(hints.iter().any(|hint| hint.name == "/skill my-review"));
+        assert!(hints.iter().all(|hint| hint.is_skill));
+    }
+
+    #[test]
+    fn slash_completion_hints_complete_skill_argument_prefix() {
+        let cached_skills = vec![
+            ("search-files".to_string(), "Search files".to_string()),
+            ("my-review".to_string(), "Review code".to_string()),
+        ];
+        let hints = slash_completion_hints(
+            "/skill my",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].name, "/skill my-review");
+        assert!(hints[0].is_skill);
+    }
+
+    #[test]
+    fn slash_completion_hints_model_deepseek_provider_uses_bare_ids() {
+        let hints =
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let names = hints
+            .iter()
+            .map(|hint| hint.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"/model deepseek-v4-pro"));
+        assert!(names.contains(&"/model deepseek-v4-flash"));
+        assert!(!names.contains(&"/model deepseek-ai/deepseek-v4-pro"));
+        assert!(!names.contains(&"/model deepseek/deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn slash_completion_hints_model_provider_uses_provider_specific_ids() {
+        let hints =
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::NvidiaNim);
+        let names = hints
+            .iter()
+            .map(|hint| hint.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"/model deepseek-ai/deepseek-v4-pro"));
+        assert!(!names.contains(&"/model deepseek/deepseek-v4-pro"));
     }
 
     #[test]
@@ -2079,7 +3107,7 @@ mod tests {
         let mut app = create_test_app();
         // Pin density so the test is independent of any loaded user settings.
         app.composer_density = ComposerDensity::Comfortable;
-        let slash_menu_entries = Vec::<String>::new();
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
         let mention_menu_entries = Vec::<String>::new();
         let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
 
@@ -2104,7 +3132,7 @@ mod tests {
     fn empty_composer_cursor_accounts_for_placeholder_wrapping() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
-        let slash_menu_entries = Vec::<String>::new();
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
         let mention_menu_entries = Vec::<String>::new();
         let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
 
@@ -2127,6 +3155,53 @@ mod tests {
     }
 
     #[test]
+    fn composer_border_renders_session_title() {
+        let mut app = create_test_app();
+        app.composer_density = ComposerDensity::Comfortable;
+        app.session_title = Some("my-session".to_string());
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 96,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(rendered.contains("Composer"));
+        assert!(rendered.contains("my-session"));
+    }
+
+    #[test]
+    fn composer_border_renders_active_turn_receipt() {
+        let mut app = create_test_app();
+        app.composer_density = ComposerDensity::Comfortable;
+        app.set_receipt_text("✓ turn completed · 2 tool(s) used");
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 96,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(rendered.contains("Composer"));
+        assert!(rendered.contains("turn completed"));
+        assert!(rendered.contains("tool(s) used"));
+    }
+
+    #[test]
     fn slash_menu_open_locks_composer_height_against_match_count_changes() {
         // Repro for the Windows 10 PowerShell + WSL feedback: typing
         // through a slash command shrinks the matched-entry list, which
@@ -2139,9 +3214,21 @@ mod tests {
         app.composer_density = ComposerDensity::Comfortable;
         app.input = "/skill".to_string();
 
-        let many_matches: Vec<String> = (0..5).map(|i| format!("/skill{i}")).collect();
-        let one_match = vec!["/skill".to_string()];
-        let no_matches = Vec::<String>::new();
+        let many_matches: Vec<SlashMenuEntry> = (0..5)
+            .map(|i| SlashMenuEntry {
+                name: format!("/skill{i}"),
+                description: String::new(),
+                is_skill: false,
+                alias_hint: None,
+            })
+            .collect();
+        let one_match = vec![SlashMenuEntry {
+            name: "/skill".to_string(),
+            description: String::new(),
+            is_skill: false,
+            alias_hint: None,
+        }];
+        let no_matches = Vec::<SlashMenuEntry>::new();
 
         let widget_many = ComposerWidget::new(&app, 9, &many_matches, &[]);
         let widget_one = ComposerWidget::new(&app, 9, &one_match, &[]);
@@ -2170,7 +3257,7 @@ mod tests {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
         app.composer_border = false;
-        let slash_menu_entries = Vec::<String>::new();
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
         let mention_menu_entries = Vec::<String>::new();
         let widget = ComposerWidget::new(&app, 3, &slash_menu_entries, &mention_menu_entries);
 
@@ -2190,7 +3277,7 @@ mod tests {
             let mut app = create_test_app();
             app.ui_locale = locale;
             app.composer_density = ComposerDensity::Comfortable;
-            let slash_menu_entries = Vec::<String>::new();
+            let slash_menu_entries = Vec::<SlashMenuEntry>::new();
             let mention_menu_entries = Vec::<String>::new();
             let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
             let area = Rect {
@@ -2233,6 +3320,29 @@ mod tests {
         assert!(!should_render_empty_state(&app));
     }
 
+    #[test]
+    fn empty_state_shows_startup_context() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
+        app.model = "deepseek-v4-pro".to_string();
+
+        let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains(&format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"))));
+        assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
+        assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
+    }
+
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total
     /// visual width exceeds the requested area width, even for pathological
     /// long single-line tool results.
@@ -2245,6 +3355,8 @@ mod tests {
             output: Some("hello world ".repeat(420)),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
         for width in [40u16, 80, 111, 165] {
             let lines = cell.lines(width);
@@ -2254,8 +3366,17 @@ mod tests {
                     .iter()
                     .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
                     .sum();
+                // Card-rail prefix (╭/│/╰ + space) adds 2 chars.
+                let rail_adjust = if line.spans.first().is_some_and(|s| {
+                    let c = s.content.as_ref();
+                    c == "\u{256D} " || c == "\u{2502} " || c == "\u{2570} "
+                }) {
+                    2usize
+                } else {
+                    0
+                };
                 assert!(
-                    visual <= usize::from(width),
+                    visual.saturating_sub(rail_adjust) <= usize::from(width),
                     "line {idx} at width {width} has visual width {visual} > {width}"
                 );
             }
@@ -2289,6 +3410,8 @@ mod tests {
                 output: Some(output),
                 prompts: None,
                 spillover_path: None,
+                output_summary: None,
+                is_diff: false,
             })));
 
             let height: u16 = 30;
@@ -2323,6 +3446,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chat_widget_uses_configured_surface_background() {
+        let mut app = create_test_app();
+        let custom = ratatui::style::Color::Rgb(26, 27, 38);
+        app.ui_theme = app.ui_theme.with_background_color(custom);
+        app.add_message(HistoryCell::Assistant {
+            content: "ready".to_string(),
+            streaming: false,
+        });
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+
+        assert_eq!(buf[(area.x, area.y)].bg, custom);
+        assert_eq!(
+            buf[(area.x + area.width - 1, area.y + area.height - 1)].bg,
+            custom
+        );
+    }
+
+    #[test]
+    fn chat_widget_does_not_render_turn_receipt_as_transcript_content() {
+        let mut app = create_test_app();
+        for i in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("assistant line {i}"),
+                streaming: false,
+            });
+        }
+        app.set_receipt_text("✓ turn completed · 2 tool(s) used");
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 48,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(!rendered.contains("turn completed"));
+        assert!(
+            rendered.contains("assistant line 7"),
+            "receipt should not displace the latest transcript line: {rendered:?}"
+        );
     }
 
     /// Regression: when the transcript scrollbar is visible, the rightmost
@@ -2370,6 +3549,241 @@ mod tests {
         assert!(
             scrollbar_seen,
             "scrollbar should be visible for a long history"
+        );
+    }
+
+    #[test]
+    fn chat_widget_shows_jump_to_latest_button_when_scrolled_up() {
+        let mut app = create_test_app();
+        app.use_mouse_capture = true;
+        for i in 0..80 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i}"),
+            });
+        }
+        app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+
+        let button = app
+            .viewport
+            .jump_to_latest_button_area
+            .expect("button appears when transcript is not at tail");
+        assert_eq!(button.width, 3);
+        assert_eq!(button.height, 3);
+        assert_eq!(buf[(button.x + 1, button.y + 1)].symbol(), "↓");
+    }
+
+    #[test]
+    fn chat_widget_uses_light_theme_scroll_chrome() {
+        let mut app = create_test_app();
+        app.ui_theme = palette::LIGHT_UI_THEME;
+        app.use_mouse_capture = true;
+        for i in 0..120 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i}"),
+            });
+        }
+        app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+
+        let mut saw_track = false;
+        let mut saw_thumb = false;
+        for y in 0..area.height {
+            let cell = &buf[(area.width - 1, y)];
+            match cell.symbol() {
+                "│" => {
+                    saw_track = true;
+                    assert_eq!(cell.fg, palette::LIGHT_UI_THEME.border);
+                }
+                "┃" => {
+                    saw_thumb = true;
+                    assert_eq!(cell.fg, palette::LIGHT_UI_THEME.status_working);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_track, "scrollbar track should render");
+        assert!(saw_thumb, "scrollbar thumb should render");
+
+        let button = app
+            .viewport
+            .jump_to_latest_button_area
+            .expect("button appears when transcript is not at tail");
+        assert_eq!(
+            buf[(button.x + 1, button.y + 1)].fg,
+            palette::LIGHT_UI_THEME.status_working
+        );
+    }
+
+    #[test]
+    fn chat_widget_hides_jump_to_latest_button_at_tail() {
+        let mut app = create_test_app();
+        app.use_mouse_capture = true;
+        for i in 0..80 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i}"),
+            });
+        }
+        app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let _widget = ChatWidget::new(&mut app, area);
+        assert!(
+            app.viewport.jump_to_latest_button_area.is_none(),
+            "button should hide while following the live tail"
+        );
+        assert!(app.viewport.transcript_scroll.is_at_tail());
+    }
+
+    /// Regression for issue #582: a resize event arriving while the
+    /// engine is in `CoherenceState::RefreshingContext` (i.e. running
+    /// a compaction summary call) must NOT leave the chat widget with
+    /// an empty viewport. The user-reported symptom on Windows
+    /// PowerShell is that the screen turns black on the maximize→
+    /// windowed transition during a long task; the post-resize render
+    /// must produce a populated frame regardless of the active
+    /// coherence intervention. Pins the invariant from the renderer
+    /// side; the actual ConHost size-stale fix lives in
+    /// `tui::ui::run_tui` (the `Event::Resize` handler now forwards
+    /// the event-reported dimensions to ratatui's viewport before the
+    /// redraw).
+    #[test]
+    fn chat_widget_renders_cleanly_after_resize_during_refreshing_context() {
+        use crate::core::coherence::CoherenceState;
+
+        let mut app = create_test_app();
+        for i in 0..30 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i} during a long-running task"),
+            });
+        }
+
+        // Pretend the engine is mid-compaction when the resize arrives.
+        app.coherence_state = CoherenceState::RefreshingContext;
+
+        // Drive the same shrink-then-grow cycle that maximize→windowed
+        // transitions produce on Windows.
+        for (width, height) in [(140u16, 40u16), (90, 28), (60, 20), (140, 40)] {
+            app.handle_resize(width, height);
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let mut buf = Buffer::empty(area);
+            let widget = ChatWidget::new(&mut app, area);
+            widget.render(area, &mut buf);
+
+            let mut non_empty = 0usize;
+            for y in 0..height {
+                for x in 0..width {
+                    let sym = buf[(x, y)].symbol();
+                    if sym != " " && !sym.is_empty() {
+                        non_empty += 1;
+                    }
+                }
+            }
+            assert!(
+                non_empty > 0,
+                "resize-during-RefreshingContext at {width}x{height} produced an empty buffer; \
+                 render path must not gate on coherence state (#582)"
+            );
+        }
+
+        // The engine's coherence_state must survive a resize — it is
+        // the engine's runtime decision, not a render-loop concern.
+        // A future regression that bounced the state to `Healthy` on
+        // resize would silently drop the "refreshing context" footer
+        // chip while compaction is still in flight.
+        assert_eq!(
+            app.coherence_state,
+            CoherenceState::RefreshingContext,
+            "resize must not mutate engine-owned coherence_state"
+        );
+    }
+
+    #[test]
+    fn approval_takeover_clamps_to_short_terminal_height() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-1",
+            "exec_shell",
+            "Run git commit",
+            &serde_json::json!({ "command": "git commit -m fix" }),
+            "exec_shell:git commit",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+
+        for area in [Rect::new(0, 0, 162, 17), Rect::new(0, 0, 39, 17)] {
+            let card_area = compute_takeover_area(area);
+            assert!(card_area.x >= area.x);
+            assert!(card_area.y >= area.y);
+            assert!(card_area.right() <= area.right());
+            assert!(card_area.bottom() <= area.bottom());
+
+            let mut buf = Buffer::empty(area);
+            widget.render(area, &mut buf);
+        }
+    }
+
+    #[test]
+    fn approval_selected_destructive_option_uses_contrasting_highlight() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-1",
+            "exec_shell",
+            "Run git commit",
+            &serde_json::json!({ "command": "git commit -m fix" }),
+            "exec_shell:git commit",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+
+        let selected_row = (area.y..area.y.saturating_add(area.height))
+            .find(|&y| {
+                (area.x..area.x.saturating_add(area.width))
+                    .any(|x| buf[(x, y)].bg == palette::DEEPSEEK_BLUE)
+            })
+            .expect("selected approval row should use blue background");
+        let highlighted_cells = (area.x..area.x.saturating_add(area.width))
+            .filter(|&x| {
+                let cell = &buf[(x, selected_row)];
+                !cell.symbol().trim().is_empty()
+                    && cell.bg == palette::DEEPSEEK_BLUE
+                    && cell.fg == palette::SELECTION_TEXT
+            })
+            .count();
+
+        assert!(
+            highlighted_cells >= 4,
+            "selected destructive option should render visible blue/white text"
         );
     }
 
@@ -2473,8 +3887,11 @@ mod tests {
     /// pays the wrap cost; subsequent calls at different offsets should hit
     /// the per-cell cache and be ~constant time regardless of offset.
     ///
-    /// Run with: `cargo test -p deepseek-tui --release bench_transcript_scroll
+    /// Run with: `cargo test -p codewhale-tui --release bench_transcript_scroll
     /// -- --ignored --nocapture`
+    // Perf bench prints timing rows to stdout — runs in `cargo test`,
+    // never inside the TUI alt-screen.
+    #[allow(clippy::print_stdout)]
     #[test]
     #[ignore = "perf bench; run with --release"]
     fn bench_transcript_scroll_5000_messages() {
@@ -2493,6 +3910,8 @@ mod tests {
                     output: Some(format!("found 12 matches in cell-{i}")),
                     prompts: None,
                     spillover_path: None,
+                    output_summary: None,
+                    is_diff: false,
                 }))
             } else if i % 2 == 0 {
                 HistoryCell::User {

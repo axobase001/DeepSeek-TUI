@@ -53,7 +53,11 @@ impl Default for CompactionConfig {
             // v0.8.11: 50K was a 128K-era leftover that biased every
             // unconfigured caller toward "compact almost immediately on V4."
             // Bumped to 800K (80% of V4's 1M window) so the dead-code
-            // default no longer lies. Real call sites override this via
+            // default matches the hard automatic compaction guardrail. This
+            // is intentionally later than the model-visible 60% "suggest
+            // /compact during sustained work" guidance; automatic replacement
+            // compaction rewrites the cacheable prefix and remains opt-in.
+            // Real call sites override this via
             // `compaction_threshold_for_model_and_effort`.
             token_threshold: 800_000,
             model: DEFAULT_TEXT_MODEL.to_string(),
@@ -94,6 +98,7 @@ const LARGE_CONTEXT_SUMMARY_TOOL_RESULT_SNIPPET_CHARS: usize = 4_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_MAX_CHARS: usize = 120_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_HEAD_CHARS: usize = 72_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_TAIL_CHARS: usize = 36_000;
+const TOOL_PRUNE_STOP_CHECK_BYTES: usize = 16 * 1024;
 const LARGE_CONTEXT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 const CACHE_ALIGNED_SUMMARY_CONTEXT_BUDGET_PERCENT: usize = 85;
@@ -291,6 +296,14 @@ fn message_text(msg: &Message) -> String {
     text
 }
 
+fn is_user_text_query(msg: &Message) -> bool {
+    msg.role == "user"
+        && msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
+}
+
 fn extract_paths_from_message(message: &Message, workspace: Option<&Path>) -> Vec<String> {
     let mut paths = Vec::new();
     for block in &message.content {
@@ -431,6 +444,21 @@ pub fn plan_compaction(
 
     // Ensure tool result messages are not kept without their corresponding tool call.
     enforce_tool_call_pairs(messages, &mut pinned_indices);
+
+    // Some OpenAI-compatible chat templates require at least one user text
+    // message. Tool-heavy tails can otherwise compact down to only tool calls
+    // and tool results, which makes those backends reject the next request.
+    if !pinned_indices
+        .iter()
+        .any(|&idx| is_user_text_query(&messages[idx]))
+        && let Some(idx) = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, msg)| is_user_text_query(msg).then_some(idx))
+    {
+        pinned_indices.insert(idx);
+    }
 
     let summarize_indices = (0..len)
         .filter(|idx| !pinned_indices.contains(idx))
@@ -749,13 +777,25 @@ struct ToolResultPruneCandidate {
     original_len: usize,
 }
 
+#[cfg(test)]
+fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> usize {
+    prune_tool_results_until(messages, protected_window, |_, _| false)
+}
+
 /// Mechanically prune old verbose tool results before paying for an LLM summary.
 ///
 /// The most recent `protected_window` messages stay byte-for-byte intact. Older
 /// duplicate tool results keep the freshest full body and replace earlier
 /// copies with one-line summaries; non-duplicate old results are summarized only
 /// when they exceed the normal summary snippet size.
-pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> usize {
+fn prune_tool_results_until<F>(
+    messages: &mut [Message],
+    protected_window: usize,
+    mut should_stop: F,
+) -> usize
+where
+    F: FnMut(&[Message], usize) -> bool,
+{
     let cutoff = messages.len().saturating_sub(protected_window);
     if cutoff == 0 {
         return 0;
@@ -792,6 +832,12 @@ pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> 
         }
     }
 
+    // The maps above are fully populated before pruning starts, so the order below
+    // only changes which message bytes are rewritten first. Pruning from newest to
+    // oldest lets callers stop as soon as enough bytes were saved, preserving the
+    // earlier JSON request prefix for byte-level KV caches.
+    candidates.reverse();
+
     let mut bytes_saved = 0usize;
     for candidate in candidates {
         let duplicate_count = count_by_key.get(&candidate.key).copied().unwrap_or(0);
@@ -821,6 +867,10 @@ pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> 
             bytes_saved = bytes_saved.saturating_add(content.len().saturating_sub(summary.len()));
             *content = summary;
             *content_blocks = None;
+
+            if should_stop(messages, bytes_saved) {
+                break;
+            }
         }
     }
 
@@ -875,26 +925,54 @@ pub async fn compact_messages_safe(
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 1000;
 
+    let was_over_threshold = should_compact(
+        messages,
+        config,
+        workspace,
+        external_pins,
+        external_working_set_paths,
+    );
     let mut pruned_messages = messages.to_vec();
-    let pruned_bytes = prune_tool_results(&mut pruned_messages, KEEP_RECENT_MESSAGES);
-    let compaction_input: &[Message] = if pruned_bytes > 0 {
-        logging::info(format!(
-            "Local tool-result prune saved {pruned_bytes} bytes before LLM compaction"
-        ));
-        let was_over_threshold = should_compact(
-            messages,
-            config,
-            workspace,
-            external_pins,
-            external_working_set_paths,
-        );
-        let now_under_threshold = !should_compact(
+    let mut now_under_threshold = false;
+    let mut next_stop_check_bytes = 0usize;
+    let pruned_bytes = prune_tool_results_until(
+        &mut pruned_messages,
+        KEEP_RECENT_MESSAGES,
+        |candidate_messages, bytes_saved| {
+            if !was_over_threshold || bytes_saved < next_stop_check_bytes {
+                return false;
+            }
+
+            // Stop at the first suffix-side prune check that clears the threshold.
+            // The check itself is a full compaction-plan pass, so bound it by saved
+            // bytes instead of running it after every candidate in huge sessions.
+            next_stop_check_bytes = bytes_saved.saturating_add(TOOL_PRUNE_STOP_CHECK_BYTES);
+            now_under_threshold = !should_compact(
+                candidate_messages,
+                config,
+                workspace,
+                external_pins,
+                external_working_set_paths,
+            );
+            now_under_threshold
+        },
+    );
+    if was_over_threshold && pruned_bytes > 0 && !now_under_threshold {
+        // The throttled in-loop check may skip the exact candidate that clears the
+        // budget. Do one final pass so a successful local prune still avoids LLM compaction.
+        now_under_threshold = !should_compact(
             &pruned_messages,
             config,
             workspace,
             external_pins,
             external_working_set_paths,
         );
+    }
+
+    let compaction_input: &[Message] = if pruned_bytes > 0 {
+        logging::info(format!(
+            "Local tool-result prune saved {pruned_bytes} bytes before LLM compaction"
+        ));
         if was_over_threshold && now_under_threshold {
             return Ok(CompactionResult {
                 messages: pruned_messages,
@@ -949,6 +1027,50 @@ pub async fn compact_messages_safe(
         .unwrap_or_else(|| anyhow::anyhow!("Compaction failed after {MAX_RETRIES} retries")))
 }
 
+fn read_workspace_anchors(workspace: Option<&Path>) -> Vec<String> {
+    let Some(ws) = workspace else {
+        return Vec::new();
+    };
+
+    // Prefer .codewhale, fall back to .deepseek
+    let primary = ws.join(".codewhale").join("anchors.md");
+    let anchors_path = if primary.exists() {
+        primary
+    } else {
+        ws.join(".deepseek").join("anchors.md")
+    };
+    let Ok(content) = std::fs::read_to_string(anchors_path) else {
+        return Vec::new();
+    };
+
+    content
+        .split("\n---\n")
+        .map(str::trim)
+        .filter(|anchor| !anchor.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn anchor_summary_section(workspace: Option<&Path>) -> String {
+    let anchors = read_workspace_anchors(workspace);
+    if anchors.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from(
+        "## Pinned Facts (User Anchors)\n\n\
+         The following facts were explicitly anchored by the user with `/anchor`. \
+         Preserve them across compaction cycles.\n\n",
+    );
+
+    for anchor in anchors {
+        let _ = writeln!(section, "- {anchor}");
+    }
+
+    section.push_str("\n---\n\n");
+    section
+}
+
 pub async fn compact_messages(
     client: &DeepSeekClient,
     messages: &[Message],
@@ -984,11 +1106,14 @@ pub async fn compact_messages(
     // Extract workflow context (files touched, tasks in progress, etc.)
     let workflow_context = extract_workflow_context(&to_summarize, workspace);
 
+    let anchors_section = anchor_summary_section(workspace);
+
     // Build new message list with enhanced summary as system block
     let summary_block = SystemBlock {
         block_type: "text".to_string(),
         text: format!(
-            "## 📋 Conversation Summary (Auto-Generated)\n\n\
+            "{anchors_section}\
+             ## 📋 Conversation Summary (Auto-Generated)\n\n\
              {summary}\n\n\
              ---\n\n\
              ## 🔍 Workflow Context\n\n\
@@ -1036,7 +1161,20 @@ async fn create_summary(
         build_formatted_summary_request(model, messages, limits)
     };
 
-    let response = client.create_message(request).await?;
+    let mut telemetry_cache_aligned = used_cache_aligned;
+    let response = match client.create_message(request).await {
+        Ok(response) => response,
+        Err(err) if used_cache_aligned && is_context_window_error(&err) => {
+            logging::warn(format!(
+                "Cache-aligned compaction summary exceeded the model context window ({err}); \
+                 retrying with bounded formatted summary input"
+            ));
+            telemetry_cache_aligned = false;
+            let fallback_request = build_formatted_summary_request(model, messages, limits);
+            client.create_message(fallback_request).await?
+        }
+        Err(err) => return Err(err),
+    };
     // Compaction summary calls are billed by DeepSeek; route the
     // tokens through the side-channel so the dashboard total
     // matches the website (#526).
@@ -1047,9 +1185,9 @@ async fn create_summary(
     // adding UI surface. The event is emitted with
     // `target = "compaction"`, so the filter is
     // `RUST_LOG=compaction=debug` (the module-path form
-    // `deepseek_tui::compaction=debug` does NOT match — `EnvFilter`
+    // `codewhale_tui::compaction=debug` does NOT match — `EnvFilter`
     // matches the explicit target string when one is set).
-    log_summary_cache_telemetry(used_cache_aligned, &response.usage);
+    log_summary_cache_telemetry(telemetry_cache_aligned, &response.usage);
 
     // Extract text from response
     let summary = response
@@ -1063,6 +1201,22 @@ async fn create_summary(
         .join("\n");
 
     Ok(summary)
+}
+
+fn is_context_window_error(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    if crate::error_taxonomy::classify_error_message(&text)
+        != crate::error_taxonomy::ErrorCategory::InvalidInput
+    {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+    lower.contains("context")
+        || lower.contains("token")
+        || lower.contains("prompt is too long")
+        || lower.contains("requested")
+        || lower.contains("maximum")
 }
 
 /// Cache-hit percentage for a compaction summary call.
@@ -1225,7 +1379,7 @@ fn build_formatted_summary_request(
                 }
                 ContentBlock::ToolResult { content, .. } => {
                     let snippet = truncate_chars(content, limits.tool_result_snippet_chars);
-                    let _ = write!(conversation_text, "Tool result: {}\n\n", snippet);
+                    let _ = write!(conversation_text, "Tool result: {snippet}\n\n");
                 }
                 ContentBlock::Thinking { .. } => {
                     // Skip thinking blocks in summary
@@ -1317,9 +1471,9 @@ fn extract_workflow_context(messages: &[Message], workspace: Option<&Path>) -> S
                     .strip_prefix(ws)
                     .unwrap_or(Path::new(file))
                     .display();
-                context.push_str(&format!("- `{}`\n", relative));
+                context.push_str(&format!("- `{relative}`\n"));
             } else {
-                context.push_str(&format!("- `{}`\n", file));
+                context.push_str(&format!("- `{file}`\n"));
             }
         }
         context.push('\n');
@@ -1334,7 +1488,7 @@ fn extract_workflow_context(messages: &[Message], workspace: Option<&Path>) -> S
     if !tasks_identified.is_empty() {
         context.push_str("**Tasks/TODOs Identified:**\n");
         for task in &tasks_identified {
-            context.push_str(&format!("- {}\n", task));
+            context.push_str(&format!("- {task}\n"));
         }
         context.push('\n');
     }
@@ -1455,6 +1609,33 @@ mod tests {
     }
 
     #[test]
+    fn anchor_summary_section_is_empty_without_workspace_or_file() {
+        assert!(anchor_summary_section(None).is_empty());
+
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        assert!(anchor_summary_section(Some(tmpdir.path())).is_empty());
+    }
+
+    #[test]
+    fn anchor_summary_section_parses_anchor_file_into_bullets() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let deepseek_dir = tmpdir.path().join(".deepseek");
+        std::fs::create_dir_all(&deepseek_dir).unwrap();
+        std::fs::write(
+            deepseek_dir.join("anchors.md"),
+            "\n---\nDo not touch .ssh\n---\nStatus field is unreliable\n",
+        )
+        .unwrap();
+
+        let section = anchor_summary_section(Some(tmpdir.path()));
+
+        assert!(section.contains("## Pinned Facts (User Anchors)"));
+        assert!(section.contains("- Do not touch .ssh\n"));
+        assert!(section.contains("- Status field is unreliable\n"));
+        assert!(!section.contains("\n---\nDo not touch"));
+    }
+
+    #[test]
     fn truncate_chars_respects_unicode_boundaries() {
         let text = "abc😀é";
         assert_eq!(truncate_chars(text, 0), "");
@@ -1501,6 +1682,60 @@ mod tests {
             panic!("expected tool result");
         };
         assert_eq!(content, &verbose);
+    }
+
+    #[test]
+    fn prune_tool_results_preserves_prefix_bytes_when_reverse_prune_is_enough() {
+        let older_verbose = "old ".repeat(SUMMARY_TOOL_RESULT_SNIPPET_CHARS + 40);
+        let newer_verbose = "new ".repeat(SUMMARY_TOOL_RESULT_SNIPPET_CHARS + 40);
+        let mut messages = vec![
+            tool_use("call-old", "read_file", json!({"path": "old.txt"})),
+            tool_result("call-old", &older_verbose),
+            tool_use("call-new", "read_file", json!({"path": "new.txt"})),
+            tool_result("call-new", &newer_verbose),
+            msg("user", "protected tail"),
+        ];
+        let original = messages.clone();
+
+        // Simulate the caller clearing its token budget after one suffix prune.
+        let saved = prune_tool_results_until(&mut messages, 1, |_, saved| saved > 0);
+
+        assert!(saved > 0);
+        assert_eq!(&messages[..3], &original[..3]);
+        assert_eq!(&messages[4..], &original[4..]);
+        let ContentBlock::ToolResult { content, .. } = &messages[3].content[0] else {
+            panic!("expected pruned tool result");
+        };
+        assert!(content.contains("[read_file] tool result pruned"));
+        assert!(content.contains("new.txt"));
+        assert!(content.len() < newer_verbose.len());
+    }
+
+    #[test]
+    fn prune_tool_results_stops_after_newest_duplicate_prune() {
+        let oldest = "oldest ".repeat(80);
+        let middle = "middle ".repeat(80);
+        let latest = "latest ".repeat(80);
+        let mut messages = vec![
+            tool_use("call-1", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-1", &oldest),
+            tool_use("call-2", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-2", &middle),
+            tool_use("call-3", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-3", &latest),
+            msg("user", "protected tail"),
+        ];
+        let original = messages.clone();
+
+        let saved = prune_tool_results_until(&mut messages, 1, |_, saved| saved > 0);
+
+        assert!(saved > 0);
+        assert_eq!(&messages[..3], &original[..3]);
+        assert_eq!(&messages[4..], &original[4..]);
+        let ContentBlock::ToolResult { content, .. } = &messages[3].content[0] else {
+            panic!("expected middle duplicate to be pruned");
+        };
+        assert!(content.contains("[read_file] tool result pruned"));
     }
 
     #[test]
@@ -1604,6 +1839,50 @@ mod tests {
         // divide-by-zero.
         assert!((summary_cache_hit_percent(0, 0) - 0.0).abs() < f64::EPSILON);
         assert!((summary_cache_hit_percent(50, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn context_window_errors_are_detected_for_summary_fallback() {
+        for msg in [
+            "HTTP 400 Bad Request: maximum context length is 1000000 tokens",
+            "invalid_request_error: prompt is too long for the current model",
+            "You requested 1000001 tokens but the maximum is 1000000",
+            "request exceeds context window",
+        ] {
+            assert!(
+                is_context_window_error(&anyhow::anyhow!(msg)),
+                "expected context-window detection for `{msg}`",
+            );
+        }
+
+        assert!(!is_context_window_error(&anyhow::anyhow!(
+            "Invalid request: missing required field"
+        )));
+        assert!(!is_context_window_error(&anyhow::anyhow!(
+            "503 Service Unavailable"
+        )));
+    }
+
+    #[test]
+    fn formatted_summary_request_bounds_large_input() {
+        let messages = (0..90)
+            .map(|idx| {
+                msg(
+                    "user",
+                    &format!("turn {idx}: {}", "中文上下文 ".repeat(1_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let limits = summary_input_limits_for_model("deepseek-v4-pro");
+
+        let request = build_formatted_summary_request("deepseek-v4-pro", &messages, limits);
+
+        assert_eq!(request.messages.len(), 1);
+        let ContentBlock::Text { text, .. } = &request.messages[0].content[0] else {
+            panic!("expected summary text request");
+        };
+        assert!(text.contains("characters omitted before summary"));
+        assert!(text.chars().count() <= limits.input_max_chars + 2_000);
     }
 
     #[test]
@@ -2124,6 +2403,39 @@ mod tests {
 
         // All pairs should remain intact (no orphans)
         assert_eq!(pinned.len(), messages.len());
+    }
+
+    #[test]
+    fn plan_compaction_keeps_at_least_one_user_text_query() {
+        let mut messages = vec![msg(
+            "user",
+            "This is the original query that started the chain.",
+        )];
+
+        for i in 0..10 {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("call-{i}"),
+                    name: "test_tool".to_string(),
+                    input: json!({}),
+                    caller: None,
+                }],
+            });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("call-{i}"),
+                    content: "tool output".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            });
+        }
+
+        let plan = plan_compaction(&messages, None, KEEP_RECENT_MESSAGES, None, None);
+
+        assert!(plan.pinned_indices.contains(&0));
     }
 
     // ========================================================================
