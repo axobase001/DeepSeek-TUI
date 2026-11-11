@@ -77,3 +77,8 @@ jobs:
             evaluator-build-receipt.txt
           if-no-files-found: error
           retention-days: 7
+
+      - name: Check evaluator crates
+        run: cargo check --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox
+      - name: Lint evaluator crates
+        run: cargo clippy --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox --lib -- -D warnings
