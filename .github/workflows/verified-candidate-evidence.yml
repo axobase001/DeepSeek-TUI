@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4ba39ea42797cd25c4c5905bb4a25b1601c369d9
+          ref: 91f9942aff887eae6342a757d487c37b7dd45937
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +49,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: 4ba39ea42797cd25c4c5905bb4a25b1601c369d9
+          ref: 91f9942aff887eae6342a757d487c37b7dd45937
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
