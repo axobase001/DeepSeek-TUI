@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all
+      - run: cargo fmt --all -- --check
       - run: git diff --binary > evaluator-rustfmt.patch
       - uses: actions/upload-artifact@v4
         with:
@@ -52,6 +52,8 @@ jobs:
           ref: 6754e0955b4a427f860d2f4de7636867bd140ad1
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Build full CLI
         run: cargo build --locked -p codewhale-cli
       - name: Run focused Rust tests
