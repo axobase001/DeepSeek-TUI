@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 629990b8eed70d7ee6e927f579ec6b133eea13c7
+          ref: eaef953458ccd08c279e11e33c06893bdb52536f
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +49,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: 629990b8eed70d7ee6e927f579ec6b133eea13c7
+          ref: eaef953458ccd08c279e11e33c06893bdb52536f
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Build full CLI
