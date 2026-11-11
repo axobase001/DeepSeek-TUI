@@ -1,0 +1,71 @@
+name: Verified candidate evidence build
+
+on:
+  push:
+    branches:
+      - experiment/7250-hosted-build
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 91f70f6
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: rockylinux:8
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc gcc-c++ make pkgconf-pkg-config dbus-devel \
+            openssl-devel cmake perl-core python3 git curl tar gzip \
+            xz-devel zlib-devel
+          dnf clean all
+      - uses: actions/checkout@v4
+        with:
+          ref: 91f70f6
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build full CLI
+        run: cargo build --locked -p codewhale-cli
+      - name: Run focused Rust tests
+        run: cargo test --locked -p codewhale-engine verified_candidate --lib -- --nocapture
+      - name: Record binary and test identity
+        run: |
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD > evaluator-build-receipt.txt
+          rustc -Vv >> evaluator-build-receipt.txt
+          cargo -V >> evaluator-build-receipt.txt
+          getconf GNU_LIBC_VERSION >> evaluator-build-receipt.txt
+          sha256sum target/debug/codewhale >> evaluator-build-receipt.txt
+          find target/debug/deps -maxdepth 1 -type f -name 'codewhale_engine-*' -perm /111 -print -quit |
+            xargs -r -I '{}' cp '{}' evaluator-engine-tests
+          sha256sum evaluator-engine-tests >> evaluator-build-receipt.txt
+          df -h . >> evaluator-build-receipt.txt
+      - name: Preserve native binaries and receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate-linux-binaries
+          path: |
+            target/debug/codewhale
+            evaluator-engine-tests
+            evaluator-build-receipt.txt
+          if-no-files-found: error
+          retention-days: 7
