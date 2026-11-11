@@ -21,7 +21,7 @@ jobs:
       - name: Check out the exact Draft PR source
         uses: actions/checkout@v4
         with:
-          ref: 5acf845250dcd976576406da0c6bad7fcff1c359
+          ref: 0bcd0685d06b73bd594ee882d690d8005509e264
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
       - name: Preserve executable and build receipt
         uses: actions/upload-artifact@v4
         with:
-          name: codewhale-r3-cli-5acf8452
+          name: codewhale-r3-cli-0bcd0685
           path: |
             target/debug/codewhale
             r3_cli_build_receipt.txt
