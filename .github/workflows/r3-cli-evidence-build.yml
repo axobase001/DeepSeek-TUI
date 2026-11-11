@@ -11,6 +11,8 @@ permissions:
 jobs:
   build-cli:
     runs-on: ubuntu-24.04
+    container:
+      image: rockylinux:8
     timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: '1'
@@ -18,17 +20,19 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       RUSTFLAGS: -C debuginfo=0
     steps:
+      - name: Install compatible Linux build dependencies
+        run: |
+          dnf install -y gcc gcc-c++ make pkgconf-pkg-config dbus-devel \
+            openssl-devel cmake perl-core python3 git curl tar gzip \
+            xz-devel zlib-devel
+          dnf clean all
       - name: Check out the exact Draft PR source
         uses: actions/checkout@v4
         with:
-          ref: 0bcd0685d06b73bd594ee882d690d8005509e264
+          ref: 52ad637c1b02565707521f5ebfe628ab7ed6b7a8
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux build dependencies
-        run: bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
-      - name: Keep runner disk within bounds
-        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - name: Build complete CodeWhale CLI
         run: cargo build --locked -p codewhale-cli
       - name: Record exact source and binary identity
@@ -37,13 +41,15 @@ jobs:
             git rev-parse HEAD
             rustc -Vv
             cargo -V
+            getconf GNU_LIBC_VERSION
             sha256sum target/debug/codewhale
+            readelf --version-info target/debug/codewhale | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1
             df -h .
           } > r3_cli_build_receipt.txt
       - name: Preserve executable and build receipt
         uses: actions/upload-artifact@v4
         with:
-          name: codewhale-r3-cli-0bcd0685
+          name: codewhale-r3-cli-52ad637c-rocky8
           path: |
             target/debug/codewhale
             r3_cli_build_receipt.txt
