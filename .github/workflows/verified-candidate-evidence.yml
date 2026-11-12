@@ -66,11 +66,13 @@ jobs:
           cargo -V >> evaluator-build-receipt.txt
           getconf GNU_LIBC_VERSION >> evaluator-build-receipt.txt
           sha256sum target/debug/codewhale >> evaluator-build-receipt.txt
-          find target/debug/deps -maxdepth 1 -type f -name 'codewhale_engine-*' -perm /111 -print -quit |
-            xargs -r -I '{}' cp '{}' evaluator-engine-tests
+          test_binary=$(find target/debug -type f -name 'codewhale_engine-*' -perm /111 -print -quit)
+          test -n "$test_binary"
+          cp "$test_binary" evaluator-engine-tests
           sha256sum evaluator-engine-tests >> evaluator-build-receipt.txt
           df -h . >> evaluator-build-receipt.txt
       - name: Preserve native binaries and receipt
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: verified-candidate-linux-binaries
@@ -78,7 +80,7 @@ jobs:
             target/debug/codewhale
             evaluator-engine-tests
             evaluator-build-receipt.txt
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Check evaluator crates
