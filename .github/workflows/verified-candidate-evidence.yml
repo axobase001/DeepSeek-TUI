@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 51c9071556279a68500f0ee896c9635e4a282487
+          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,7 +50,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: 51c9071556279a68500f0ee896c9635e4a282487
+          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -115,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 51c9071556279a68500f0ee896c9635e4a282487
+          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -136,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 51c9071556279a68500f0ee896c9635e4a282487
+          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Check engine and sandbox on Windows
