@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e365276d6a56849fad09e3d30691b219a52bd3ec
+          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +49,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: e365276d6a56849fad09e3d30691b219a52bd3ec
+          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,3 +84,40 @@ jobs:
         run: cargo check --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox
       - name: Lint evaluator crates
         run: cargo clippy --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox --lib -- -D warnings
+      - name: List packaged engine files
+        run: cargo package --list --locked -p codewhale-engine > evaluator-package-list.txt
+      - name: Verify packaged engine independently
+        run: |
+          set -o pipefail
+          cargo package --locked -p codewhale-engine 2>&1 | tee evaluator-package-verify.log
+      - name: Preserve package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate-package-evidence
+          path: |
+            evaluator-package-list.txt
+            evaluator-package-verify.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check engine and sandbox on macOS
+        run: cargo check --locked -p codewhale-engine -p codewhale-sandbox
+      - name: Lint engine and sandbox on macOS
+        run: cargo clippy --locked -p codewhale-engine -p codewhale-sandbox --lib -- -D warnings
