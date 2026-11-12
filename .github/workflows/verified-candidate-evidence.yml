@@ -1,6 +1,7 @@
 name: Verified candidate evidence build
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - experiment/7250-hosted-build
