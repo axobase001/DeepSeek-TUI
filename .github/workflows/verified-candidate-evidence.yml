@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
+          ref: 51c9071556279a68500f0ee896c9635e4a282487
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,7 +50,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
+          ref: 51c9071556279a68500f0ee896c9635e4a282487
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,8 +83,6 @@ jobs:
 
       - name: Check evaluator crates
         run: cargo check --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox
-      - name: Lint evaluator crates
-        run: cargo clippy --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox --lib -- -D warnings
       - name: List packaged engine files
         run: cargo package --list --locked -p codewhale-engine > evaluator-package-list.txt
       - name: Verify packaged engine independently
@@ -101,6 +99,8 @@ jobs:
             evaluator-package-verify.log
           if-no-files-found: warn
           retention-days: 7
+      - name: Lint evaluator crates
+        run: cargo clippy --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox --lib -- -D warnings
 
   macos:
     runs-on: macos-15
@@ -113,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3770b947f423c633f4dbcc36207f6116bfa83fa6
+          ref: 51c9071556279a68500f0ee896c9635e4a282487
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -122,3 +122,22 @@ jobs:
         run: cargo check --locked -p codewhale-engine -p codewhale-sandbox
       - name: Lint engine and sandbox on macOS
         run: cargo clippy --locked -p codewhale-engine -p codewhale-sandbox --lib -- -D warnings
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 51c9071556279a68500f0ee896c9635e4a282487
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check engine and sandbox on Windows
+        run: cargo check --locked -p codewhale-engine -p codewhale-sandbox
+      - name: Run focused evaluator tests on Windows
+        run: cargo test --locked -p codewhale-engine verified_candidate --lib -- --nocapture
