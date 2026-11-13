@@ -2,6 +2,9 @@ name: Verified candidate evidence build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - experiment/7250-hosted-build
 
 permissions:
   contents: read
@@ -12,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
+          ref: a381ae98150ee8215411f836bd536bb52197507e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,7 +50,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
+          ref: a381ae98150ee8215411f836bd536bb52197507e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -112,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
+          ref: a381ae98150ee8215411f836bd536bb52197507e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -133,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
+          ref: a381ae98150ee8215411f836bd536bb52197507e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Check engine and sandbox on Windows
