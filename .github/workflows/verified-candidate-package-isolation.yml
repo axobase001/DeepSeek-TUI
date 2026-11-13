@@ -1,0 +1,77 @@
+name: Verified candidate package isolation
+
+on:
+  push:
+    branches:
+      - experiment/7250-hosted-build
+
+permissions:
+  contents: read
+
+jobs:
+  package-isolation:
+    runs-on: ubuntu-24.04
+    container:
+      image: rockylinux:8
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc gcc-c++ make pkgconf-pkg-config dbus-devel \
+            openssl-devel cmake perl-core python3 git curl tar gzip \
+            xz-devel zlib-devel
+          dnf clean all
+      - uses: actions/checkout@v4
+        with:
+          ref: 750eedb774f6c1d43d6689afb7abbd18844968da
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: List and create published crate archive
+        run: |
+          set -o pipefail
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD > package-source-sha.txt
+          cargo package --list --locked -p codewhale-engine > package-list.txt
+          cargo package --locked --no-verify -p codewhale-engine 2>&1 | tee package-noverify.log
+          tar -tzf target/package/codewhale-engine-0.10.3.crate > package-contents.txt
+          ! grep -q 'operate_best_of_n.workflow.js' package-contents.txt
+          ! grep -q 'verified_candidate/tests.rs' package-contents.txt
+      - name: Compile extracted crate without repository Workflow file
+        run: |
+          set -o pipefail
+          isolated=$(mktemp -d /tmp/cw7250-package.XXXXXX)
+          tar -xzf target/package/codewhale-engine-0.10.3.crate -C "$isolated"
+          packaged="$isolated/codewhale-engine-0.10.3"
+          test ! -e "$isolated/workflows/operate_best_of_n.workflow.js"
+          python3 - "$packaged/Cargo.toml" "$GITHUB_WORKSPACE/crates" <<'PY'
+          import pathlib, re, sys
+          manifest = pathlib.Path(sys.argv[1])
+          crates = pathlib.Path(sys.argv[2])
+          patches = []
+          for crate in sorted(crates.glob('*/Cargo.toml')):
+              source = crate.read_text()
+              name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', source)
+              if name and name.group(1) != 'codewhale-engine':
+                  patches.append(f'{name.group(1)} = {{ path = "{crate.parent}" }}')
+          manifest.write_text(manifest.read_text() + '\n[patch.crates-io]\n' + '\n'.join(patches) + '\n')
+          pathlib.Path('package-isolated-patches.txt').write_text('\n'.join(patches) + '\n')
+          PY
+          cargo check --manifest-path "$packaged/Cargo.toml" --lib 2>&1 | tee package-isolated-check.log
+      - name: Preserve package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate-isolated-package-evidence
+          path: |
+            package-source-sha.txt
+            package-list.txt
+            package-contents.txt
+            package-noverify.log
+            package-isolated-patches.txt
+            package-isolated-check.log
+          if-no-files-found: warn
+          retention-days: 7
