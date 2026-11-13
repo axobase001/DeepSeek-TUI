@@ -31,36 +31,36 @@ jobs:
           ref: 750eedb774f6c1d43d6689afb7abbd18844968da
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: List and create published crate archive
+      - name: List published crate files
         run: |
-          set -o pipefail
           git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD > package-source-sha.txt
           cargo package --list --locked -p codewhale-engine > package-list.txt
-          cargo package --locked --no-verify -p codewhale-engine 2>&1 | tee package-noverify.log
-          tar -tzf target/package/codewhale-engine-0.10.3.crate > package-contents.txt
-          ! grep -q 'operate_best_of_n.workflow.js' package-contents.txt
-          ! grep -q 'verified_candidate/tests.rs' package-contents.txt
-      - name: Compile extracted crate without repository Workflow file
+          ! grep -q 'operate_best_of_n.workflow.js' package-list.txt
+          ! grep -q 'verified_candidate/tests.rs' package-list.txt
+      - name: Compile published file set without repository Workflow file
         run: |
           set -o pipefail
           isolated=$(mktemp -d /tmp/cw7250-package.XXXXXX)
-          tar -xzf target/package/codewhale-engine-0.10.3.crate -C "$isolated"
-          packaged="$isolated/codewhale-engine-0.10.3"
-          test ! -e "$isolated/workflows/operate_best_of_n.workflow.js"
-          python3 - "$packaged/Cargo.toml" "$GITHUB_WORKSPACE/crates" <<'PY'
-          import pathlib, re, sys
-          manifest = pathlib.Path(sys.argv[1])
-          crates = pathlib.Path(sys.argv[2])
-          patches = []
-          for crate in sorted(crates.glob('*/Cargo.toml')):
-              source = crate.read_text()
-              name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', source)
-              if name and name.group(1) != 'codewhale-engine':
-                  patches.append(f'{name.group(1)} = {{ path = "{crate.parent}" }}')
-          manifest.write_text(manifest.read_text() + '\n[patch.crates-io]\n' + '\n'.join(patches) + '\n')
-          pathlib.Path('package-isolated-patches.txt').write_text('\n'.join(patches) + '\n')
+          git -c safe.directory="$GITHUB_WORKSPACE" archive HEAD | tar -x -C "$isolated"
+          python3 - "$GITHUB_WORKSPACE/crates/engine" "$isolated/crates/engine" package-list.txt <<'PY'
+          import pathlib, shutil, sys
+          source, destination, listing = map(pathlib.Path, sys.argv[1:])
+          assert str(destination).startswith('/tmp/cw7250-package.')
+          shutil.rmtree(destination)
+          for line in listing.read_text().splitlines():
+              relative = pathlib.PurePosixPath(line)
+              assert not relative.is_absolute() and '..' not in relative.parts
+              original = source.joinpath(*relative.parts)
+              if not original.is_file():
+                  assert line in {'.cargo_vcs_info.json', 'Cargo.lock', 'Cargo.toml.orig'}, line
+                  continue
+              target = destination.joinpath(*relative.parts)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(original, target)
           PY
-          cargo check --manifest-path "$packaged/Cargo.toml" --lib 2>&1 | tee package-isolated-check.log
+          rm "$isolated/workflows/operate_best_of_n.workflow.js"
+          test ! -e "$isolated/workflows/operate_best_of_n.workflow.js"
+          (cd "$isolated" && cargo check --locked -p codewhale-engine --lib) 2>&1 | tee package-isolated-check.log
       - name: Preserve package evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,9 +69,6 @@ jobs:
           path: |
             package-source-sha.txt
             package-list.txt
-            package-contents.txt
-            package-noverify.log
-            package-isolated-patches.txt
             package-isolated-check.log
           if-no-files-found: warn
           retention-days: 7
