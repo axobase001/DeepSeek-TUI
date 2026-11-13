@@ -28,7 +28,7 @@ jobs:
           dnf clean all
       - uses: actions/checkout@v4
         with:
-          ref: a381ae98150ee8215411f836bd536bb52197507e
+          ref: 61b889cf6ec10df5c048ef15715dbb272ccacf77
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: List published crate files
