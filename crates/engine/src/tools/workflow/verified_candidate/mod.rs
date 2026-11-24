@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 const AUTHORIZED_WORKFLOW_SHA256: &str =
     "55d5544578f0f6f5d7e046221a4e11f36fd97b28f94996e640daec271144ca36";
+const AUTHORIZED_EVOLUTION_WORKFLOW_SHA256: &str =
+    "ff047738a6a9479734e5ae67bdd7449553324c0ffc119196067a7dc10e49970f";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +46,8 @@ struct Spec {
     version: u32,
     objective: String,
     baseline_sha: String,
+    #[serde(default)]
+    authorized_workflow_sha256: Option<String>,
     allowed_write_roots: Vec<String>,
     protected_paths: Vec<String>,
     isolation_backend: String,
@@ -51,10 +55,17 @@ struct Spec {
     hard_gates: Vec<Gate>,
 }
 
+#[derive(Clone)]
+struct ParentSeed {
+    parent_candidate_id: String,
+    parent_artifact_id: String,
+}
+
 pub(super) struct VerifiedCandidateEvaluator {
     spec: Spec,
     spec_path: PathBuf,
     spec_hash: String,
+    workflow_hash: String,
     manifest_hash: String,
     binary_hash: String,
     executable_hashes: HashMap<String, String>,
@@ -68,6 +79,8 @@ pub(super) struct VerifiedCandidateEvaluator {
     started_at_ms: Option<u64>,
     evaluation_elapsed: Duration,
     evaluated: HashMap<String, Value>,
+    staged_parents: HashMap<String, ParentSeed>,
+    seeded_parents: HashMap<String, ParentSeed>,
 }
 
 fn candidate_id(value: &str) -> Result<(), String> {
@@ -111,8 +124,41 @@ fn hash(bytes: &[u8]) -> String {
         .collect()
 }
 
-pub(super) fn authorized_workflow_source(source: &str) -> bool {
-    hash(source.as_bytes()) == AUTHORIZED_WORKFLOW_SHA256
+#[cfg(test)]
+fn authorized_workflow_source(source: &str) -> bool {
+    let normalized = source.replace("\r\n", "\n");
+    matches!(
+        hash(normalized.as_bytes()).as_str(),
+        AUTHORIZED_WORKFLOW_SHA256 | AUTHORIZED_EVOLUTION_WORKFLOW_SHA256
+    )
+}
+
+fn verify_workflow_source(
+    source: &str,
+    pinned_sha256: Option<&str>,
+) -> Result<String, String> {
+    let normalized = source.replace("\r\n", "\n");
+    let actual = hash(normalized.as_bytes());
+    if let Some(expected) = pinned_sha256 {
+        if expected.len() != 64
+            || !expected
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err("authorized_workflow_sha256 must be 64 lowercase hex characters".to_string());
+        }
+        if actual != expected {
+            return Err("workflow source differs from spec.authorized_workflow_sha256".to_string());
+        }
+        return Ok(actual);
+    }
+    if !matches!(
+        actual.as_str(),
+        AUTHORIZED_WORKFLOW_SHA256 | AUTHORIZED_EVOLUTION_WORKFLOW_SHA256
+    ) {
+        return Err("verified evaluator requires an authorized search Workflow".to_string());
+    }
+    Ok(actual)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -452,6 +498,7 @@ impl VerifiedCandidateEvaluator {
         workspace: &Path,
         run_id: &str,
         brief: &str,
+        workflow_source: &str,
     ) -> Result<Self, String> {
         candidate_id(run_id)?;
         let repo = PathBuf::from(git_text(workspace, &["rev-parse", "--show-toplevel"])?)
@@ -476,6 +523,10 @@ impl VerifiedCandidateEvaluator {
         }
         let mut spec: Spec =
             serde_json::from_slice(&spec_bytes).map_err(|error| error.to_string())?;
+        let workflow_hash = verify_workflow_source(
+            workflow_source,
+            spec.authorized_workflow_sha256.as_deref(),
+        )?;
         let baseline_sha = git_text(&repo, &["rev-parse", "HEAD"])?;
         if spec.version != 1
             || spec.objective != brief
@@ -583,6 +634,7 @@ impl VerifiedCandidateEvaluator {
                 "version": 1,
                 "run_id": run_id,
                 "spec_sha256": hash(&spec_bytes),
+                "workflow_sha256": workflow_hash,
                 "baseline_sha": spec.baseline_sha,
                 "baseline_id": store.baseline_id(),
                 "public_fixture_sha256": case_hashes.iter().zip(&spec.hard_gates)
@@ -614,6 +666,7 @@ impl VerifiedCandidateEvaluator {
                 spec,
                 spec_path,
                 spec_hash: hash(&spec_bytes),
+                workflow_hash,
                 manifest_hash: hash(&manifest_bytes),
                 binary_hash,
                 executable_hashes,
@@ -627,6 +680,8 @@ impl VerifiedCandidateEvaluator {
                 started_at_ms: None,
                 evaluation_elapsed: Duration::ZERO,
                 evaluated: HashMap::new(),
+                staged_parents: HashMap::new(),
+                seeded_parents: HashMap::new(),
             })
         })();
         if frozen.is_err() {
@@ -667,6 +722,7 @@ impl VerifiedCandidateEvaluator {
             "baseline_sha": self.spec.baseline_sha,
             "baseline_id": self.store.baseline_id(),
             "spec_sha256": self.spec_hash,
+            "workflow_sha256": self.workflow_hash,
             "sandbox_probe": self.sandbox_probe,
             "capture_policy": artifact::capture_policy(),
             "evaluation_started_at_ms": self.started_at_ms,
@@ -675,23 +731,65 @@ impl VerifiedCandidateEvaluator {
         })
     }
 
-    pub(super) fn evaluate(
+    pub(super) fn has_staged_parent(&self, child_id: &str) -> bool {
+        self.staged_parents.contains_key(child_id)
+    }
+
+    pub(super) fn stage_parent(
         &mut self,
-        id: &str,
-        worktree: &Path,
-        completed: bool,
-        cancel: &CancellationToken,
+        child_id: &str,
+        parent_id: &str,
     ) -> Result<Value, String> {
-        candidate_id(id)?;
-        if !completed || cancel.is_cancelled() {
-            return Err("candidate worker has not completed or run was cancelled".to_string());
-        }
-        if self.evaluated.contains_key(id)
-            || self.root.join(format!("{id}-evaluation.json")).exists()
+        candidate_id(child_id)?;
+        candidate_id(parent_id)?;
+        if child_id == parent_id
+            || self.evaluated.contains_key(child_id)
+            || self.staged_parents.contains_key(child_id)
+            || self.seeded_parents.contains_key(child_id)
+            || self.root.join(format!("{child_id}-evaluation.json")).exists()
         {
-            return Err("candidate already evaluated".to_string());
+            return Err("invalid or already-claimed child candidate identifier".to_string());
         }
         self.verify_frozen_inputs()?;
+        let parent_receipt = self
+            .evaluated
+            .get(parent_id)
+            .ok_or("missing verified parent evaluation")?;
+        if !matches!(
+            parent_receipt.get("status").and_then(Value::as_str),
+            Some("PASS" | "FAIL")
+        ) {
+            return Err("only scope-valid PASS or FAIL candidates can seed a child".to_string());
+        }
+        let manifest_bytes = fs::read(self.root.join("artifacts").join(format!("{parent_id}.json")))
+            .map_err(|error| error.to_string())?;
+        let manifest_digest = hash(&manifest_bytes);
+        if parent_receipt
+            .get("artifact_manifest_sha256")
+            .and_then(Value::as_str)
+            != Some(manifest_digest.as_str())
+        {
+            return Err("sealed parent artifact manifest changed".to_string());
+        }
+        let artifact = self.store.load(parent_id)?;
+        validate_scope(
+            &artifact,
+            &self.spec.allowed_write_roots,
+            &self.spec.protected_paths,
+        )?;
+        let seed = ParentSeed {
+            parent_candidate_id: parent_id.to_string(),
+            parent_artifact_id: artifact.artifact_id.clone(),
+        };
+        self.staged_parents.insert(child_id.to_string(), seed);
+        Ok(json!({
+            "candidate_id": child_id,
+            "parent_candidate_id": parent_id,
+            "parent_artifact_id": artifact.artifact_id,
+        }))
+    }
+
+    fn verify_candidate_worktree(&self, worktree: &Path) -> Result<PathBuf, String> {
         let worktree = worktree.canonicalize().map_err(|error| error.to_string())?;
         if worktree == self.repo
             || git_text(&worktree, &["rev-parse", "HEAD"])? != self.spec.baseline_sha
@@ -713,11 +811,78 @@ impl VerifiedCandidateEvaluator {
         if common_dir(&worktree)? != common_dir(&self.repo)? {
             return Err("candidate worktree does not belong to frozen repository".to_string());
         }
+        Ok(worktree)
+    }
+
+    pub(super) fn seed_worktree(&mut self, child_id: &str, worktree: &Path) -> Result<(), String> {
+        candidate_id(child_id)?;
+        if self.seeded_parents.contains_key(child_id) {
+            return Err("candidate worktree was already seeded".to_string());
+        }
+        let seed = self
+            .staged_parents
+            .remove(child_id)
+            .ok_or("no staged parent artifact for candidate")?;
+        self.verify_frozen_inputs()?;
+        let worktree = self.verify_candidate_worktree(worktree)?;
+        let status = git_text(
+            &worktree,
+            &["status", "--porcelain", "--untracked-files=normal"],
+        )?;
+        if status.lines().any(|line| line != "?? .codewhale/") {
+            return Err("target child worktree is not clean before parent seed".to_string());
+        }
+        let artifact = self.store.load(&seed.parent_candidate_id)?;
+        if artifact.artifact_id != seed.parent_artifact_id {
+            return Err("sealed parent artifact identity changed before seed".to_string());
+        }
+        validate_scope(
+            &artifact,
+            &self.spec.allowed_write_roots,
+            &self.spec.protected_paths,
+        )?;
+        self.store.seed_worktree(&artifact, &worktree)?;
+        self.seeded_parents.insert(child_id.to_string(), seed);
+        Ok(())
+    }
+
+    pub(super) fn evaluate(
+        &mut self,
+        id: &str,
+        worktree: &Path,
+        completed: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        candidate_id(id)?;
+        if !completed || cancel.is_cancelled() {
+            return Err("candidate worker has not completed or run was cancelled".to_string());
+        }
+        if self.evaluated.contains_key(id)
+            || self.root.join(format!("{id}-evaluation.json")).exists()
+        {
+            return Err("candidate already evaluated".to_string());
+        }
+        if self.staged_parents.contains_key(id) {
+            return Err(
+                "staged parent artifact was never materialized into a candidate worktree"
+                    .to_string(),
+            );
+        }
+        self.verify_frozen_inputs()?;
+        let worktree = self.verify_candidate_worktree(worktree)?;
+        let parent_artifact_ids = self
+            .seeded_parents
+            .get(id)
+            .map(|seed| vec![seed.parent_artifact_id.clone()])
+            .unwrap_or_default();
         self.begin_evaluation()?;
         let result = (|| {
-            let artifact =
-                self.store
-                    .capture(&worktree, id, Vec::new(), &self.spec.protected_paths)?;
+            let artifact = self.store.capture(
+                &worktree,
+                id,
+                parent_artifact_ids,
+                &self.spec.protected_paths,
+            )?;
             self.run_candidate(id, &artifact, false, cancel)
         })();
         self.finish_evaluation();
@@ -769,6 +934,7 @@ impl VerifiedCandidateEvaluator {
         if original.get("oracle_sha256") != Some(&json!(self.case_hashes))
             || original.get("executable_sha256") != Some(&json!(self.executable_hashes))
             || original.get("sandbox_probe") != Some(&self.sandbox_probe)
+            || original.get("parent_artifact_ids") != Some(&json!(artifact.parent_artifact_ids))
         {
             return Err(
                 "original receipt oracle or execution identity differs from frozen spec"
@@ -869,6 +1035,7 @@ impl VerifiedCandidateEvaluator {
             "baseline_sha": self.spec.baseline_sha,
             "baseline_id": self.store.baseline_id(),
             "artifact_id": artifact.artifact_id,
+            "parent_artifact_ids": artifact.parent_artifact_ids,
             "candidate_tree_hash": artifact.candidate_tree_hash,
             "artifact_manifest_sha256": artifact_manifest_sha256,
             "oracle_sha256": self.case_hashes,

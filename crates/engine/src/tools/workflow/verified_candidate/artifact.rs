@@ -385,15 +385,7 @@ impl ArtifactStore {
         Ok(artifact)
     }
 
-    pub(super) fn materialize(
-        &self,
-        artifact: &Artifact,
-        destination: &Path,
-    ) -> Result<(), String> {
-        if destination.exists() {
-            return Err("evaluation materialization already exists".to_string());
-        }
-        fs::create_dir(destination).map_err(|error| error.to_string())?;
+    fn verified_tree(&self, artifact: &Artifact) -> Result<Vec<FileEntry>, String> {
         let mut files = self
             .baseline
             .iter()
@@ -440,6 +432,19 @@ impl ArtifactStore {
         if tree.len() > MAX_FILES || total > MAX_TREE_BYTES {
             return Err("materialized tree exceeds limits".to_string());
         }
+        Ok(tree)
+    }
+
+    pub(super) fn materialize(
+        &self,
+        artifact: &Artifact,
+        destination: &Path,
+    ) -> Result<(), String> {
+        if destination.exists() {
+            return Err("evaluation materialization already exists".to_string());
+        }
+        fs::create_dir(destination).map_err(|error| error.to_string())?;
+        let tree = self.verified_tree(artifact)?;
         for entry in tree {
             let bytes = fs::read(self.root.join("blobs").join(&entry.blob_hash))
                 .map_err(|error| error.to_string())?;
@@ -459,6 +464,58 @@ impl ArtifactStore {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&target, fs::Permissions::from_mode(entry.mode & 0o777))
                     .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn seed_worktree(
+        &self,
+        artifact: &Artifact,
+        worktree: &Path,
+    ) -> Result<(), String> {
+        let _ = self.verified_tree(artifact)?;
+        for change in &artifact.entries {
+            let target = worktree.join(&change.path);
+            match change.kind.as_str() {
+                "deleted" => {
+                    if let Ok(meta) = fs::symlink_metadata(&target) {
+                        if !meta.is_file() || meta.file_type().is_symlink() {
+                            return Err(format!(
+                                "cannot remove non-regular path during seed: {}",
+                                change.path
+                            ));
+                        }
+                        fs::remove_file(&target).map_err(|error| error.to_string())?;
+                    }
+                }
+                "file" => {
+                    let blob_hash = change.blob_hash.as_ref().ok_or("missing artifact blob")?;
+                    let expected_size = change.size_bytes.ok_or("missing artifact size")?;
+                    let file_mode = change.mode.ok_or("missing artifact mode")?;
+                    let bytes = fs::read(self.root.join("blobs").join(blob_hash))
+                        .map_err(|error| error.to_string())?;
+                    if bytes.len() as u64 != expected_size || digest(&bytes) != *blob_hash {
+                        return Err(format!(
+                            "sealed artifact blob verification failed: {}",
+                            change.path
+                        ));
+                    }
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                    }
+                    fs::write(&target, bytes).map_err(|error| error.to_string())?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(
+                            &target,
+                            fs::Permissions::from_mode(file_mode & 0o777),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+                _ => return Err("invalid artifact change kind".to_string()),
             }
         }
         Ok(())

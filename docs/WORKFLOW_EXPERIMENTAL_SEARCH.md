@@ -47,13 +47,15 @@ public and one held-out gate must each require a nonzero number of cases.
 Invoke the existing `workflow` tool, or use the CLI `workflow-tool --input-json`
 equivalent. For `source_path`, place the checked-in Workflow file inside the
 active workspace or `~/.codewhale/workflows`; the host hashes the actual loaded
-script bytes and compares them with the checked-in authorized SHA-256 constant.
+script bytes and compares them with the checked-in authorized SHA-256 constants
+(`workflows/operate_best_of_n.workflow.js` or
+`workflows/operate_evolution_search.workflow.js`), or with an explicit 64-hex
+`authorized_workflow_sha256` pinned in the external `evaluator.json` spec.
 Alternatively, pass that file's exact text as
 `script`, as the native E2E below does.
 
-When the checked-in Workflow changes, calculate
-`sha256sum workflows/operate_best_of_n.workflow.js`, update
-`AUTHORIZED_WORKFLOW_SHA256` in `verified_candidate/mod.rs`, and run the
+When a checked-in search Workflow changes, calculate its `sha256sum`, update the
+corresponding constant in `verified_candidate/mod.rs`, and run the
 repository-script identity test plus `cargo package -p codewhale-engine --locked`.
 The repository script path appears only in the test source, which is excluded
 from the published crate.
@@ -152,7 +154,14 @@ version. These restrictions deliberately keep the trusted execution surface
 small.
 
 Policy genomes, mutation, selection, strategy transfer, model-turn planning,
-and promotion research remain separate from this evaluator.
+and promotion research remain outside the Rust evaluator host. Multi-generation
+failure-guided repair lives in the standalone Workflow recipe
+`workflows/operate_evolution_search.workflow.js`, which uses
+`task.verifyCandidate({ action: "stage_parent", candidate_id, parent_candidate_id })`
+to overlay a scope-valid `PASS` or `FAIL` parent's sealed artifact onto a fresh
+`baseline_sha` child worktree before the child worker runs, recording
+`parent_artifact_ids` in the child's evaluation and replay receipts while
+keeping every outcome `proposal_only`.
 
 For a repeatable Linux run using a local scripted provider, a synthetic Git
 workspace, both public and held-out cases, and the real CLI entry:

@@ -116,8 +116,15 @@ impl Fixture {
 
     #[cfg(target_os = "linux")]
     fn freeze(&self, id: &str) -> VerifiedCandidateEvaluator {
-        VerifiedCandidateEvaluator::freeze(&self.manifest, &self.repo, id, "increment an integer")
-            .unwrap()
+        let source = include_str!("../../../../../../workflows/operate_best_of_n.workflow.js");
+        VerifiedCandidateEvaluator::freeze(
+            &self.manifest,
+            &self.repo,
+            id,
+            "increment an integer",
+            source,
+        )
+        .unwrap()
     }
 }
 
@@ -136,14 +143,36 @@ fn bwrap_available() -> bool {
 
 #[test]
 fn checked_in_workflow_identity_is_exact() {
-    let source = include_str!("../../../../../../workflows/operate_best_of_n.workflow.js");
-    assert_eq!(hash(source.as_bytes()), AUTHORIZED_WORKFLOW_SHA256);
-    assert!(authorized_workflow_source(source));
-    assert!(!authorized_workflow_source(&format!("{source}\n")));
+    let best_of_n = include_str!("../../../../../../workflows/operate_best_of_n.workflow.js");
+    let evolution =
+        include_str!("../../../../../../workflows/operate_evolution_search.workflow.js");
+    assert_eq!(
+        hash(best_of_n.replace("\r\n", "\n").as_bytes()),
+        AUTHORIZED_WORKFLOW_SHA256
+    );
+    assert_eq!(
+        hash(evolution.replace("\r\n", "\n").as_bytes()),
+        AUTHORIZED_EVOLUTION_WORKFLOW_SHA256
+    );
+    assert!(authorized_workflow_source(best_of_n));
+    assert!(authorized_workflow_source(evolution));
+    assert!(!authorized_workflow_source(&format!("{best_of_n}\n")));
+    assert!(!authorized_workflow_source(&format!("{evolution}\n")));
+
+    let custom = "export default async function () { return { ok: true }; }\n";
+    let custom_sha = hash(custom.as_bytes());
+    assert!(verify_workflow_source(custom, None).is_err());
+    assert_eq!(
+        verify_workflow_source(custom, Some(&custom_sha)).unwrap(),
+        custom_sha
+    );
+    assert!(verify_workflow_source(&format!("{custom}//edited"), Some(&custom_sha)).is_err());
+    assert!(verify_workflow_source(custom, Some("not-a-hex-digest")).is_err());
 }
 
 #[test]
 fn declared_baseline_and_case_identity_fail_closed() {
+    let source = include_str!("../../../../../../workflows/operate_best_of_n.workflow.js");
     let fixture = Fixture::new();
     fixture.edit_spec(|spec| spec["baseline_sha"] = json!("0".repeat(40)));
     assert!(
@@ -151,12 +180,23 @@ fn declared_baseline_and_case_identity_fail_closed() {
             &fixture.manifest,
             &fixture.repo,
             "baseline_mismatch",
-            "increment an integer"
+            "increment an integer",
+            source,
         )
         .is_err()
     );
     fixture
         .edit_spec(|spec| spec["baseline_sha"] = json!(git(&fixture.repo, &["rev-parse", "HEAD"])));
+    assert!(
+        VerifiedCandidateEvaluator::freeze(
+            &fixture.manifest,
+            &fixture.repo,
+            "tampered_workflow",
+            "increment an integer",
+            &format!("{source}\n"),
+        )
+        .is_err()
+    );
     fixture.edit_spec(|spec| spec["hard_gates"][0]["min_tests"] = json!(0));
     fixture.edit_spec(|spec| spec["hard_gates"][1]["min_tests"] = json!(0));
     assert!(
@@ -164,7 +204,8 @@ fn declared_baseline_and_case_identity_fail_closed() {
             &fixture.manifest,
             &fixture.repo,
             "zero_tests",
-            "increment an integer"
+            "increment an integer",
+            source,
         )
         .is_err()
     );
@@ -174,7 +215,8 @@ fn declared_baseline_and_case_identity_fail_closed() {
             &fixture.manifest,
             &fixture.repo,
             "unsupported",
-            "increment an integer"
+            "increment an integer",
+            source,
         )
         .is_err()
     );
@@ -238,6 +280,82 @@ fn sealed_artifact_survives_deleted_worktree_and_rejects_tampering() {
     )
     .unwrap();
     assert!(store.load("sealed_1").is_err());
+}
+
+#[test]
+fn artifact_seed_overlays_added_modified_and_deleted_entries_onto_clean_worktree() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("obsolete.py"), "remove = True\n").unwrap();
+    git(&fixture.repo, &["add", "obsolete.py"]);
+    git(
+        &fixture.repo,
+        &[
+            "-c",
+            "user.name=Evaluator Test",
+            "-c",
+            "user.email=evaluator@example.invalid",
+            "commit",
+            "-qm",
+            "add obsolete file",
+        ],
+    );
+    let parent_wt = fixture.temp.path().join("parent_wt");
+    let child_wt = fixture.temp.path().join("child_wt");
+    for wt in [&parent_wt, &child_wt] {
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    }
+    let root = fixture.temp.path().join("seed_store");
+    let store = ArtifactStore::freeze(&fixture.repo, &root).unwrap();
+    fs::remove_file(parent_wt.join("obsolete.py")).unwrap();
+    fs::write(parent_wt.join("helper.py"), "DELTA = 1\n").unwrap();
+    fs::write(
+        parent_wt.join("candidate.py"),
+        "import helper,json,sys\nprint(json.dumps(json.load(sys.stdin)+helper.DELTA))\n",
+    )
+    .unwrap();
+    let parent_artifact = store
+        .capture(&parent_wt, "cand_g0_1", Vec::new(), &[])
+        .unwrap();
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            parent_wt.to_str().unwrap(),
+        ],
+    );
+    store.seed_worktree(&parent_artifact, &child_wt).unwrap();
+    assert!(!child_wt.join("obsolete.py").exists());
+    assert_eq!(
+        fs::read_to_string(child_wt.join("helper.py")).unwrap(),
+        "DELTA = 1\n"
+    );
+    let child_artifact = store
+        .capture(
+            &child_wt,
+            "cand_g1_1",
+            vec![parent_artifact.artifact_id.clone()],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        child_artifact.candidate_tree_hash,
+        parent_artifact.candidate_tree_hash
+    );
+    assert_eq!(
+        child_artifact.parent_artifact_ids,
+        vec![parent_artifact.artifact_id]
+    );
 }
 
 #[test]
@@ -437,6 +555,97 @@ fn trusted_oracle_beats_candidate_claim_and_replay_uses_seal() {
     assert_eq!(replay["test_count"], 2);
     assert_eq!(replay["artifact_id"], passed["artifact_id"]);
     assert_eq!(replay["candidate_tree_hash"], passed["candidate_tree_hash"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn staged_parent_seeds_child_worktree_records_lineage_and_rejects_rejected_parent() {
+    if !bwrap_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut evaluator = fixture.freeze("lineage");
+
+    fs::create_dir(fixture.worktree.join("tests")).unwrap();
+    fs::write(fixture.worktree.join("tests/test_bad.py"), "x = 1\n").unwrap();
+    let rejected = evaluator
+        .evaluate(
+            "cand_rejected",
+            &fixture.worktree,
+            true,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(rejected["status"], "REJECTED");
+    assert!(
+        evaluator
+            .stage_parent("cand_child_bad", "cand_rejected")
+            .is_err()
+    );
+    fs::remove_dir_all(fixture.worktree.join("tests")).unwrap();
+
+    fs::write(fixture.worktree.join("helper.py"), "OFFSET = 2\n").unwrap();
+    fs::write(
+        fixture.worktree.join("candidate.py"),
+        "import helper,json,sys\nprint(json.dumps(json.load(sys.stdin)+helper.OFFSET))\n",
+    )
+    .unwrap();
+    let parent = evaluator
+        .evaluate(
+            "cand_g0_1",
+            &fixture.worktree,
+            true,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(parent["status"], "FAIL");
+    assert_eq!(parent["parent_artifact_ids"], json!([]));
+
+    let staged = evaluator.stage_parent("cand_g1_1", "cand_g0_1").unwrap();
+    assert_eq!(staged["parent_artifact_id"], parent["artifact_id"]);
+    assert!(
+        evaluator
+            .evaluate(
+                "cand_g1_1",
+                &fixture.worktree,
+                true,
+                &CancellationToken::new(),
+            )
+            .is_err()
+    );
+
+    let child_wt = fixture.temp.path().join("child_candidate");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            child_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    evaluator.seed_worktree("cand_g1_1", &child_wt).unwrap();
+    assert!(child_wt.join("helper.py").exists());
+
+    fs::write(child_wt.join("helper.py"), "OFFSET = 1\n").unwrap();
+    let child = evaluator
+        .evaluate(
+            "cand_g1_1",
+            &child_wt,
+            true,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(child["status"], "PASS");
+    assert_eq!(child["parent_artifact_ids"], json!([parent["artifact_id"]]));
+
+    let replay = evaluator
+        .replay("cand_g1_1", &CancellationToken::new())
+        .unwrap();
+    assert_eq!(replay["status"], "PASS");
+    assert_eq!(replay["test_count"], 2);
+    assert_eq!(replay["parent_artifact_ids"], json!([parent["artifact_id"]]));
 }
 
 #[cfg(target_os = "linux")]

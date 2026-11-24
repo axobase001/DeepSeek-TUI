@@ -1879,6 +1879,17 @@ pub struct WorkflowTaskSpawnResult {
     pub metadata: WorkflowTaskSpawnMetadata,
 }
 
+#[derive(Clone)]
+pub struct WorktreeSeedHook(
+    pub std::sync::Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>,
+);
+
+impl std::fmt::Debug for WorktreeSeedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorktreeSeedHook(..)")
+    }
+}
+
 /// Workflow identity stamped onto children launched via `spawn_workflow_task`
 /// (#4119). Lets panel/history render without parsing the child prompt.
 #[derive(Debug, Clone)]
@@ -1899,6 +1910,9 @@ pub struct WorkflowTaskSpawnIdentity {
     /// Host-only member captured from the exact Fleet snapshot. This value is
     /// never deserialized from tool input or looked up in the selected Fleet.
     pub exact_fleet_binding: Option<crate::fleet::exact::ExactMemberBinding>,
+    /// Optional host-verified artifact overlay applied to a fresh child
+    /// worktree before the child runtime starts.
+    pub worktree_seed: Option<WorktreeSeedHook>,
 }
 
 #[derive(Debug, Clone)]
@@ -16106,6 +16120,7 @@ async fn spawn_subagent_from_input(
         let worktree = spawn_request.worktree.clone();
         let session_name = spawn_request.session_name.clone();
         let agent_type = spawn_request.agent_type.clone();
+        let worktree_seed = workflow_identity.and_then(|identity| identity.worktree_seed.clone());
         spawn_prep_blocking(move || {
             let child_workspace = prepare_child_workspace(
                 &parent_workspace,
@@ -16120,6 +16135,12 @@ async fn spawn_subagent_from_input(
                     .filter(|_| worktree.is_some())
                     .cloned(),
             );
+            if let Some(seed) = worktree_seed {
+                let target = pending.0.as_deref().ok_or_else(|| {
+                    ToolError::invalid_input("worktree seed requires an isolated child worktree")
+                })?;
+                (seed.0)(target).map_err(ToolError::invalid_input)?;
+            }
             Ok((child_workspace, pending))
         })
         .await?

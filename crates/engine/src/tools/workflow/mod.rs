@@ -43,8 +43,8 @@ use crate::tools::spec::{
 };
 use crate::tools::subagent::{
     SharedSubAgentManager, SubAgentCompletion, SubAgentManager, SubAgentResult, SubAgentRuntime,
-    SubAgentStatus, WorkflowTaskSpawnIdentity, WorkflowTaskSpawnMetadata, send_terminal_event,
-    spawn_workflow_task,
+    SubAgentStatus, WorkflowTaskSpawnIdentity, WorkflowTaskSpawnMetadata, WorktreeSeedHook,
+    send_terminal_event, spawn_workflow_task,
 };
 use crate::tools::verifier::run_workflow_completion_gates;
 use crate::tools::workflow_plan_approval::{
@@ -57,7 +57,7 @@ use crate::work_graph::{
 };
 use codewhale_agent_contract::role::{FleetRole, public_role_label};
 use codewhale_util::utils::spawn_supervised;
-use verified_candidate::{VerifiedCandidateEvaluator, authorized_workflow_source};
+use verified_candidate::VerifiedCandidateEvaluator;
 
 /// Keep promoted artifacts compact without clipping ordinary evidence reports.
 /// A 900-character cap cut six-line source receipts in half during live Fleet
@@ -1427,11 +1427,9 @@ async fn start_workflow(
     };
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
     let evaluator = if let Some(request) = args.get("evaluator") {
-        if args.get("strategy").and_then(Value::as_str) != Some("search")
-            || !authorized_workflow_source(&source.source)
-        {
+        if args.get("strategy").and_then(Value::as_str) != Some("search") {
             return Err(ToolError::invalid_input(
-                "verified evaluator requires the checked-in search Workflow",
+                "verified evaluator requires strategy=search",
             ));
         }
         let manifest = request
@@ -1446,9 +1444,16 @@ async fn start_workflow(
         let workspace = context.workspace.clone();
         let id = run_id.clone();
         let brief = brief.to_owned();
+        let workflow_source = source.source.clone();
         Some(
             tokio::task::spawn_blocking(move || {
-                VerifiedCandidateEvaluator::freeze(&path, &workspace, &id, &brief)
+                VerifiedCandidateEvaluator::freeze(
+                    &path,
+                    &workspace,
+                    &id,
+                    &brief,
+                    &workflow_source,
+                )
             })
             .await
             .map_err(|error| ToolError::execution_failed(error.to_string()))?
@@ -5005,6 +5010,49 @@ impl SubAgentWorkflowDriver {
             .map(|label| label.trim())
             .filter(|label| !label.is_empty())
             .map(str::to_string);
+        let worktree_seed = if let Some(label) = workflow_task_label.as_ref() {
+            let evaluator = self
+                .evaluator
+                .lock()
+                .map_err(|_| DriverError::Unavailable("evaluator lock poisoned".to_string()))?
+                .clone();
+            if let Some(evaluator) = evaluator {
+                let staged = evaluator
+                    .lock()
+                    .map_err(|_| DriverError::Unavailable("evaluator lock poisoned".to_string()))?
+                    .has_staged_parent(label);
+                if staged {
+                    if !request.worktree
+                        || request.write_authority.as_deref() != Some("worktree_write")
+                    {
+                        drop(permit);
+                        if let Some(receipt) = &fleet_receipt {
+                            self.record_orphaned_fleet_receipt(
+                                receipt,
+                                "staged parent artifact requires worktree_write candidate",
+                            );
+                        }
+                        return Err(DriverError::Rejected(
+                            "staged parent artifact requires worktree=true and writeAuthority=worktree_write"
+                                .to_string(),
+                        ));
+                    }
+                    let child_label = label.clone();
+                    Some(WorktreeSeedHook(Arc::new(move |target| {
+                        evaluator
+                            .lock()
+                            .map_err(|_| "evaluator lock poisoned".to_string())?
+                            .seed_worktree(&child_label, target)
+                    })))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let identity = WorkflowTaskSpawnIdentity {
             workflow_run_id: self.run_id.clone(),
             workflow_phase_id,
@@ -5016,6 +5064,7 @@ impl SubAgentWorkflowDriver {
             fleet_authority_fingerprint: fleet_receipt
                 .as_ref()
                 .and_then(|receipt| receipt.authority_fingerprint.clone()),
+            worktree_seed,
         };
         let result =
             match spawn_workflow_task(request, self.manager.clone(), runtime, identity).await {
@@ -5144,7 +5193,7 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 .map_err(|_| DriverError::Unavailable("evaluator lock poisoned".to_string()))
                 .map(|evaluator| evaluator.summary());
         }
-        if action != "evaluate" && action != "replay" {
+        if !matches!(action, "evaluate" | "replay" | "stage_parent") {
             return Err(DriverError::Rejected(
                 "unsupported evaluator action".to_string(),
             ));
@@ -5154,6 +5203,24 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
             .and_then(Value::as_str)
             .ok_or_else(|| DriverError::Rejected("candidate_id is required".to_string()))?
             .to_owned();
+        if action == "stage_parent" {
+            let parent_id = request
+                .get("parent_candidate_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DriverError::Rejected("parent_candidate_id is required".to_string())
+                })?
+                .to_owned();
+            return tokio::task::spawn_blocking(move || {
+                let mut evaluator = evaluator
+                    .lock()
+                    .map_err(|_| "evaluator lock poisoned".to_string())?;
+                evaluator.stage_parent(&id, &parent_id)
+            })
+            .await
+            .map_err(|error| DriverError::Unavailable(error.to_string()))?
+            .map_err(DriverError::Rejected);
+        }
         let record = if action == "evaluate" {
             let records = self
                 .task_records
