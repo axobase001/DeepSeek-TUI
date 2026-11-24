@@ -1,4 +1,4 @@
-name: Post-7294 Evolution VPS Build
+name: Verified candidate evidence build
 
 on:
   workflow_dispatch:
@@ -75,6 +75,8 @@ jobs:
           cargo build --locked -p codewhale-cli
           cargo test --locked -p codewhale-engine verified_candidate --lib --no-run
       - name: Run non-bwrap verified_candidate unit tests
+        env:
+          CI: ''
         run: |
           cargo test --locked -p codewhale-engine verified_candidate --lib -- --nocapture
       - name: Package binaries for 47 VPS
@@ -88,6 +90,7 @@ jobs:
           cp "$test_binary" evaluator-engine-tests
           sha256sum evaluator-engine-tests >> evaluator-build-receipt.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: post-7294-linux-binaries
           path: |
