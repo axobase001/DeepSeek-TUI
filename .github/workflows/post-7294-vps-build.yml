@@ -1,0 +1,115 @@
+name: Post-7294 Evolution VPS Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/post-7294-vps-build
+
+permissions:
+  contents: read
+
+jobs:
+  fmt-and-clippy:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libssl-dev
+      - uses: actions/checkout@v4
+        with:
+          ref: 8a94c2442528100df9e8a9e9d29d031444d0edb0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check rustfmt
+        id: fmt
+        continue-on-error: true
+        run: |
+          cargo fmt --all -- --check || {
+            cargo fmt --all
+            git diff --binary > evaluator-rustfmt.patch
+            exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        if: failure() && steps.fmt.outcome == 'failure'
+        with:
+          name: evaluator-rustfmt-patch
+          path: evaluator-rustfmt.patch
+      - name: Fail if fmt failed
+        if: steps.fmt.outcome == 'failure'
+        run: exit 1
+      - name: Strict Clippy on engine, workflow-js, sandbox
+        run: cargo clippy --locked -p codewhale-engine -p codewhale-workflow-js -p codewhale-sandbox --lib -- -D warnings
+
+  rocky8-vps-binaries:
+    runs-on: ubuntu-24.04
+    container:
+      image: rockylinux:8
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc gcc-c++ make pkgconf-pkg-config dbus-devel \
+            openssl-devel cmake perl-core python3 git curl tar gzip \
+            xz-devel zlib-devel
+          dnf clean all
+      - uses: actions/checkout@v4
+        with:
+          ref: 8a94c2442528100df9e8a9e9d29d031444d0edb0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI and verified_candidate test binary
+        run: |
+          cargo build --locked -p codewhale-cli
+          cargo test --locked -p codewhale-engine verified_candidate --lib --no-run
+      - name: Run non-bwrap verified_candidate unit tests
+        run: |
+          cargo test --locked -p codewhale-engine verified_candidate --lib -- --nocapture
+      - name: Package binaries for 47 VPS
+        run: |
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD > evaluator-build-receipt.txt
+          rustc -Vv >> evaluator-build-receipt.txt
+          getconf GNU_LIBC_VERSION >> evaluator-build-receipt.txt
+          sha256sum target/debug/codewhale >> evaluator-build-receipt.txt
+          test_binary=$(find target/debug/deps -maxdepth 1 -type f -name 'codewhale_engine-*' -perm /111 -print -quit)
+          test -n "$test_binary"
+          cp "$test_binary" evaluator-engine-tests
+          sha256sum evaluator-engine-tests >> evaluator-build-receipt.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: post-7294-linux-binaries
+          path: |
+            target/debug/codewhale
+            evaluator-engine-tests
+            evaluator-build-receipt.txt
+          retention-days: 7
+
+  windows-tests:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8a94c2442528100df9e8a9e9d29d031444d0edb0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run verified_candidate tests on Windows
+        run: cargo test --locked -p codewhale-engine verified_candidate --lib -- --nocapture
