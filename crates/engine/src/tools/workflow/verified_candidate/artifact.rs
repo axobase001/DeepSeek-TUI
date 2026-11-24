@@ -469,11 +469,7 @@ impl ArtifactStore {
         Ok(())
     }
 
-    pub(super) fn seed_worktree(
-        &self,
-        artifact: &Artifact,
-        worktree: &Path,
-    ) -> Result<(), String> {
+    pub(super) fn seed_worktree(&self, artifact: &Artifact, worktree: &Path) -> Result<(), String> {
         let _ = self.verified_tree(artifact)?;
         for change in &artifact.entries {
             let target = worktree.join(&change.path);
@@ -508,11 +504,8 @@ impl ArtifactStore {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(
-                            &target,
-                            fs::Permissions::from_mode(file_mode & 0o777),
-                        )
-                        .map_err(|error| error.to_string())?;
+                        fs::set_permissions(&target, fs::Permissions::from_mode(file_mode & 0o777))
+                            .map_err(|error| error.to_string())?;
                     }
                 }
                 _ => return Err("invalid artifact change kind".to_string()),

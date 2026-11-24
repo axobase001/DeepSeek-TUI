@@ -304,13 +304,7 @@ fn artifact_seed_overlays_added_modified_and_deleted_entries_onto_clean_worktree
     for wt in [&parent_wt, &child_wt] {
         git(
             &fixture.repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                wt.to_str().unwrap(),
-                "HEAD",
-            ],
+            &["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"],
         );
     }
     let root = fixture.temp.path().join("seed_store");
@@ -327,12 +321,7 @@ fn artifact_seed_overlays_added_modified_and_deleted_entries_onto_clean_worktree
         .unwrap();
     git(
         &fixture.repo,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            parent_wt.to_str().unwrap(),
-        ],
+        &["worktree", "remove", "--force", parent_wt.to_str().unwrap()],
     );
     store.seed_worktree(&parent_artifact, &child_wt).unwrap();
     assert!(!child_wt.join("obsolete.py").exists());
@@ -630,12 +619,7 @@ fn staged_parent_seeds_child_worktree_records_lineage_and_rejects_rejected_paren
 
     fs::write(child_wt.join("helper.py"), "OFFSET = 1\n").unwrap();
     let child = evaluator
-        .evaluate(
-            "cand_g1_1",
-            &child_wt,
-            true,
-            &CancellationToken::new(),
-        )
+        .evaluate("cand_g1_1", &child_wt, true, &CancellationToken::new())
         .unwrap();
     assert_eq!(child["status"], "PASS");
     assert_eq!(child["parent_artifact_ids"], json!([parent["artifact_id"]]));
@@ -645,7 +629,10 @@ fn staged_parent_seeds_child_worktree_records_lineage_and_rejects_rejected_paren
         .unwrap();
     assert_eq!(replay["status"], "PASS");
     assert_eq!(replay["test_count"], 2);
-    assert_eq!(replay["parent_artifact_ids"], json!([parent["artifact_id"]]));
+    assert_eq!(
+        replay["parent_artifact_ids"],
+        json!([parent["artifact_id"]])
+    );
 }
 
 #[cfg(target_os = "linux")]

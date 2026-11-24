@@ -1447,13 +1447,7 @@ async fn start_workflow(
         let workflow_source = source.source.clone();
         Some(
             tokio::task::spawn_blocking(move || {
-                VerifiedCandidateEvaluator::freeze(
-                    &path,
-                    &workspace,
-                    &id,
-                    &brief,
-                    &workflow_source,
-                )
+                VerifiedCandidateEvaluator::freeze(&path, &workspace, &id, &brief, &workflow_source)
             })
             .await
             .map_err(|error| ToolError::execution_failed(error.to_string()))?

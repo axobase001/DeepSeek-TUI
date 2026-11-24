@@ -133,10 +133,7 @@ fn authorized_workflow_source(source: &str) -> bool {
     )
 }
 
-fn verify_workflow_source(
-    source: &str,
-    pinned_sha256: Option<&str>,
-) -> Result<String, String> {
+fn verify_workflow_source(source: &str, pinned_sha256: Option<&str>) -> Result<String, String> {
     let normalized = source.replace("\r\n", "\n");
     let actual = hash(normalized.as_bytes());
     if let Some(expected) = pinned_sha256 {
@@ -145,7 +142,9 @@ fn verify_workflow_source(
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         {
-            return Err("authorized_workflow_sha256 must be 64 lowercase hex characters".to_string());
+            return Err(
+                "authorized_workflow_sha256 must be 64 lowercase hex characters".to_string(),
+            );
         }
         if actual != expected {
             return Err("workflow source differs from spec.authorized_workflow_sha256".to_string());
@@ -523,10 +522,8 @@ impl VerifiedCandidateEvaluator {
         }
         let mut spec: Spec =
             serde_json::from_slice(&spec_bytes).map_err(|error| error.to_string())?;
-        let workflow_hash = verify_workflow_source(
-            workflow_source,
-            spec.authorized_workflow_sha256.as_deref(),
-        )?;
+        let workflow_hash =
+            verify_workflow_source(workflow_source, spec.authorized_workflow_sha256.as_deref())?;
         let baseline_sha = git_text(&repo, &["rev-parse", "HEAD"])?;
         if spec.version != 1
             || spec.objective != brief
@@ -746,7 +743,10 @@ impl VerifiedCandidateEvaluator {
             || self.evaluated.contains_key(child_id)
             || self.staged_parents.contains_key(child_id)
             || self.seeded_parents.contains_key(child_id)
-            || self.root.join(format!("{child_id}-evaluation.json")).exists()
+            || self
+                .root
+                .join(format!("{child_id}-evaluation.json"))
+                .exists()
         {
             return Err("invalid or already-claimed child candidate identifier".to_string());
         }
@@ -761,8 +761,12 @@ impl VerifiedCandidateEvaluator {
         ) {
             return Err("only scope-valid PASS or FAIL candidates can seed a child".to_string());
         }
-        let manifest_bytes = fs::read(self.root.join("artifacts").join(format!("{parent_id}.json")))
-            .map_err(|error| error.to_string())?;
+        let manifest_bytes = fs::read(
+            self.root
+                .join("artifacts")
+                .join(format!("{parent_id}.json")),
+        )
+        .map_err(|error| error.to_string())?;
         let manifest_digest = hash(&manifest_bytes);
         if parent_receipt
             .get("artifact_manifest_sha256")
